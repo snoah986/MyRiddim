@@ -1,0 +1,31 @@
+# --- Credentials & session data (never commit) ---
+browser.json
+oauth.json
+*.cookie
+
+# --- Local databases & listening stats ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Local runtime state ---
+.freebuff/
+__pycache__/
+*.pyc
+
+# --- Frontend build output ---
+dist/
+node_modules/
+
+# --- Tauri / Rust build output ---
+src-tauri/target/
+src-tauri/gen/
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log

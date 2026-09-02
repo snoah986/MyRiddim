@@ -1,0 +1,72 @@
+name: Tauri Desktop Build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Linux system deps for webkit2gtk (Tauri 2)
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The backend is bundled as a sidecar (PyInstaller) so the desktop app
+      # carries its own Python runtime. Skip if binaries/ is empty — the app
+      # falls back to a system python at runtime.
+      - name: Build backend sidecar
+        shell: bash
+        run: |
+          python -m pip install --quiet pyinstaller -r backend/requirements.txt
+          pyinstaller --onefile --name ytm-backend backend/app.py --distpath src-tauri/binaries --workpath build/pyi --specpath build/pyi
+
+      # Tauri sidecars must carry the target-triple suffix in their file name.
+      - name: Rename sidecar for the target triple
+        shell: bash
+        run: |
+          TRIPLE=""
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then TRIPLE="x86_64-pc-windows-msvc.exe"; fi
+          if [ "${{ matrix.platform }}" = "macos-latest" ]; then TRIPLE="aarch64-apple-darwin"; fi
+          if [ "${{ matrix.platform }}" = "ubuntu-22.04" ]; then TRIPLE="x86_64-unknown-linux-gnu"; fi
+          mv "src-tauri/binaries/ytm-backend"* "src-tauri/binaries/ytm-backend-$TRIPLE"
+
+      - name: Generate icons
+        run: node scripts/generate-icons.mjs && node scripts/generate-tauri-icons.mjs
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'ytm-player ${{ github.ref_name }}'
+          releaseBody: 'Desktop build of ytm-player.'
+          releaseDraft: true
+          prerelease: false
