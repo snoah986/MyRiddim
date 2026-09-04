@@ -2,3 +2,5 @@ flask
 flask-cors
 ytmusicapi
 yt-dlp
+rapidfuzz
+requests

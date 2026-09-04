@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>myriddim Remote</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0d0b0a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="myriddim">
+  <link rel="manifest" href="/mobile-manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/mobile-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Anton&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { color-scheme: dark; --bg:#0d0b0a; --surface:#17110f; --card:#1c1512; --paper:#f2ece4; --muted:#a99b8f; --muted2:#7a6d64; --line:#ffffff16; --safe-top:max(env(safe-area-inset-top), 18px); --safe-bottom:max(env(safe-area-inset-bottom), 18px); }
+    * { box-sizing:border-box; }
+    html, body { margin:0; min-height:100%; background:var(--bg); }
+    body { min-height:100svh; overflow:hidden; color:var(--paper); font-family:Manrope,system-ui,sans-serif; -webkit-tap-highlight-color:transparent; user-select:none; }
+    button,input { font:inherit; }
+    button { border:0; color:inherit; cursor:pointer; }
+    .app { position:relative; display:flex; flex-direction:column; min-height:100svh; overflow:hidden; background:radial-gradient(circle at 50% -8%,#f2ece41a,transparent 46%),var(--bg); }
+    .app:before { content:""; position:absolute; inset:-30%; z-index:0; pointer-events:none; background:radial-gradient(circle at 40% 22%,var(--glow,#f2ece41a),transparent 32%); opacity:.55; filter:blur(70px); }
+    .topbar,.main,.dock { position:relative; z-index:1; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; padding:var(--safe-top) 20px 10px; }
+    .brand { font:400 22px Anton,sans-serif; letter-spacing:.02em; }
+    .connection { display:flex; align-items:center; gap:7px; color:var(--muted); font-size:11px; }
+    .connection i { width:7px; height:7px; border-radius:50%; background:#f87171; }.connection.online i { background:#34d399; box-shadow:0 0 12px #34d399; }
+    .top-actions { display:flex; gap:8px; }.icon { display:grid; place-items:center; width:36px; height:36px; border:1px solid var(--line); border-radius:50%; color:var(--muted); background:#ffffff0a; }.icon.active { color:#111; background:var(--paper); }
+    .main { display:flex; flex:1; min-height:0; flex-direction:column; align-items:center; justify-content:center; gap:0; padding:10px 24px 16px; }
+    .art-wrap { width:min(78vw,340px); aspect-ratio:1; overflow:hidden; border:1px solid var(--line); border-radius:28px; background:var(--surface); box-shadow:0 28px 80px #000b; }.art-wrap img { width:100%; height:100%; object-fit:cover; }.art-wrap.empty { display:grid; place-items:center; color:var(--muted); font-size:5rem; }
+    .meta { width:min(100%,390px); margin-top:22px; text-align:center; }.meta h1 { overflow:hidden; margin:0; font:400 clamp(24px,7vw,34px)/1.05 Anton,sans-serif; text-overflow:ellipsis; white-space:nowrap; }.meta p { overflow:hidden; margin:8px 0 0; color:var(--muted); font-size:14px; text-overflow:ellipsis; white-space:nowrap; }.meta small { display:block; margin-top:4px; color:var(--muted2); font-size:11px; }
+    .dock { padding:0 20px var(--safe-bottom); }.volume { display:flex; align-items:center; gap:8px; margin:0 auto 12px; width:min(100%,390px); color:var(--muted2); font-size:10px; }.volume input { flex:1; min-width:0; accent-color:var(--paper); }.scrubber { display:flex; align-items:center; gap:10px; color:var(--muted2); font-size:10px; font-variant-numeric:tabular-nums; }.scrubber input { flex:1; min-width:0; accent-color:var(--paper); }.controls { display:flex; align-items:center; justify-content:space-between; margin:14px auto 16px; width:min(100%,390px); }.control { display:grid; place-items:center; width:40px; height:40px; border:1px solid var(--line); border-radius:50%; color:var(--muted); background:#ffffff0a; transition:transform .2s ease,background .2s ease; }.control:active { transform:scale(.9); }.control.skip { width:48px; height:48px; color:var(--paper); }.control.play { width:62px; height:62px; color:#111; background:var(--paper); box-shadow:0 10px 28px #0009; }.control svg { width:18px; height:18px; }.control.play svg { width:24px; height:24px; }
+    .tabs { display:flex; justify-content:center; gap:4px; padding:4px; border:1px solid var(--line); border-radius:999px; background:#ffffff08; }.tabs button { padding:8px 15px; border-radius:999px; color:var(--muted); background:transparent; font-size:11px; font-weight:700; }.tabs button.active { color:#111; background:var(--paper); }
+    .drawer { position:fixed; inset:auto 0 0; z-index:5; display:flex; height:min(78svh,680px); flex-direction:column; padding:10px 20px var(--safe-bottom); border-top:1px solid var(--line); border-radius:30px 30px 0 0; background:#17110ff5; box-shadow:0 -24px 70px #000b; backdrop-filter:blur(25px); transform:translateY(105%); transition:transform .35s cubic-bezier(.2,.8,.2,1); }.drawer.open { transform:translateY(0); }.handle { width:46px; height:4px; margin:0 auto 16px; border-radius:99px; background:#ffffff33; }.drawer-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }.drawer-head h2 { margin:0; font:400 24px Anton,sans-serif; }.done { padding:8px 13px; border:1px solid var(--line); border-radius:999px; color:var(--muted); background:#ffffff0a; font-size:11px; }.drawer-body { flex:1; min-height:0; overflow:auto; padding-bottom:12px; }.lyrics-line { display:block; width:100%; padding:9px 0; color:#ffffff55; background:none; text-align:center; font-size:20px; font-weight:700; }.lyrics-line.active { color:var(--paper); }.queue-row { display:flex; align-items:center; gap:10px; padding:9px 0; border-bottom:1px solid #ffffff0d; }.queue-row img { width:44px; height:44px; border-radius:10px; object-fit:cover; }.queue-row div { min-width:0; }.queue-row strong,.queue-row span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.queue-row span { margin-top:3px; color:var(--muted); font-size:11px; }.search-form { display:flex; gap:8px; margin-bottom:14px; }.search-form input { flex:1; min-width:0; padding:12px 14px; border:1px solid var(--line); border-radius:999px; outline:none; color:var(--paper); background:#ffffff0a; }.search-form button { padding:0 16px; border-radius:999px; color:#111; background:var(--paper); font-size:12px; font-weight:700; }.search-result { display:flex; align-items:center; gap:10px; width:100%; padding:9px 0; border-bottom:1px solid #ffffff0d; background:none; text-align:left; }.search-result img { width:44px; height:44px; border-radius:10px; object-fit:cover; }.search-result span { min-width:0; }.search-result strong,.search-result small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.search-result small { margin-top:3px; color:var(--muted); }.empty { padding:28px 8px; color:var(--muted); text-align:center; font-size:13px; }.toast { position:fixed; left:50%; bottom:calc(var(--safe-bottom) + 100px); z-index:10; max-width:calc(100% - 40px); padding:10px 14px; border:1px solid var(--line); border-radius:999px; background:#000c; transform:translateX(-50%); font-size:11px; }
+    @media (min-width:700px) { .app { width:430px; min-height:100vh; margin:auto; border-right:1px solid var(--line); border-left:1px solid var(--line); } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar"><div class="brand">myriddim</div><div id="connection" class="connection"><i></i><span>Connecting…</span></div><div class="top-actions"><button class="icon" id="lyrics-btn" aria-label="Open lyrics">♫</button><button class="icon" id="queue-btn" aria-label="Open queue">☷</button></div></header>
+    <main class="main"><div id="art-wrap" class="art-wrap empty">♫</div><div class="meta"><h1 id="title">No track playing</h1><p id="artist">Connect your desktop player</p><small id="album"></small></div></main>
+    <footer class="dock"><div class="scrubber"><span id="current">0:00</span><input id="seek" type="range" min="0" max="0" step=".1" value="0" aria-label="Seek"><span id="duration">0:00</span></div><div class="controls"><button class="control" id="shuffle" aria-label="Toggle shuffle">⇄</button><button class="control skip" id="previous" aria-label="Previous track">|◀</button><button class="control play" id="play" aria-label="Play">▶</button><button class="control skip" id="next" aria-label="Next track">▶|</button><button class="control" id="repeat" aria-label="Toggle repeat">↻</button></div><label class="volume"><span>Volume</span><input id="volume" type="range" min="0" max="1" step=".01" value="1" aria-label="Volume"></label><nav class="tabs"><button class="active" data-tab="player">Now playing</button><button data-tab="search">Search</button></nav></footer>
+    <section class="drawer" id="drawer" aria-label="Remote drawer"><div class="handle"></div><div class="drawer-head"><h2 id="drawer-title">Queue</h2><button class="done" id="drawer-close">Done</button></div><div class="drawer-body" id="drawer-body"></div></section><div class="toast" id="toast" hidden></div>
+  </div>
+  <script>
+    let base = localStorage.getItem('myriddim.remoteBase') || `${location.protocol}//${location.host}`;
+    let state = { current_track:null, is_playing:false, current_time:0, duration:0, volume:1, queue:[], lyrics:[] };
+    let activeDrawer = null, pollTimer, toastTimer, lyricsFor = null, lyricsLoading = false, lyricsRequest = 0, searchRequest = 0, syncRequest = 0, commandChain = Promise.resolve(), seekTimer, pendingSeek = null, isSeeking = false;
+    const $ = (id) => document.getElementById(id);
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+    const time = (value) => { const n=Number(value); if (!Number.isFinite(n)) return '0:00'; return `${Math.floor(n/60)}:${String(Math.floor(n%60)).padStart(2,'0')}`; };
+    function showToast(message) { $('toast').textContent=message; $('toast').hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('toast').hidden=true,2600); }
+    async function request(path, options) { const response=await fetch(`${base}${path}`,options); if (!response.ok) throw Error(`Request failed (${response.status})`); return response.json(); }
+    function render() {
+      const track=state.current_track || {}; const art=$('art-wrap');
+      $('title').textContent=track.title || 'No track playing'; $('artist').textContent=track.artist || 'Connect your desktop player'; $('album').textContent=track.album || '';
+      art.classList.toggle('empty', !track.thumbnail); art.innerHTML=track.thumbnail ? `<img src="${escapeHtml(track.thumbnail)}" alt="">` : '♫';
+      $('current').textContent=time(state.current_time); $('duration').textContent=time(state.duration); $('seek').max=state.duration || 0; if(!isSeeking) $('seek').value=Math.min(state.current_time || 0,state.duration || 0); $('volume').value=state.volume ?? 1; $('play').innerHTML=state.is_playing ? '❚❚' : '▶'; $('play').ariaLabel=state.is_playing ? 'Pause' : 'Play'; $('shuffle').classList.toggle('active', !!state.shuffle); $('repeat').classList.toggle('active', state.repeat && state.repeat !== 'off');
+      $('connection').classList.add('online'); $('connection').querySelector('span').textContent='Connected';
+      document.documentElement.style.setProperty('--glow', state.current_track?.palette?.ambient || '#f2ece41a');
+      if (activeDrawer==='queue') renderQueue(); if (activeDrawer==='lyrics') { if (lyricsFor !== (track.videoId || track.id)) loadLyrics(track); else renderLyrics(); }
+    }
+    async function sync() {
+      const requestId=++syncRequest;
+      try {
+        const data=await request('/api/remote/state');
+        if(requestId!==syncRequest) return;
+        state={...state,...data}; render();
+      } catch {
+        if(requestId!==syncRequest) return;
+        $('connection').classList.remove('online'); $('connection').querySelector('span').textContent='Offline';
+      }
+    }
+    function send(action,payload=null,refresh=true) {
+      commandChain = commandChain.then(async () => {
+        try { await request('/api/remote/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,payload})}); if(refresh) await sync(); }
+        catch { showToast('Desktop player is unreachable'); }
+      });
+      return commandChain;
+    }
+    function beginSeek() { isSeeking=true; }
+    function scheduleSeek(value) {
+      pendingSeek=Number(value);
+      clearTimeout(seekTimer);
+      seekTimer = setTimeout(() => { if(pendingSeek!==null) { const value=pendingSeek; pendingSeek=null; send('seek', value); } }, 80);
+    }
+    function endSeek() {
+      isSeeking=false;
+      clearTimeout(seekTimer);
+      if(pendingSeek!==null) { const value=pendingSeek; pendingSeek=null; send('seek', value); }
+    }
+    function openDrawer(type) {
+      if(activeDrawer===type) type=null;
+      activeDrawer=type; $('drawer').classList.toggle('open',!!type);
+      if(type!=='lyrics') { lyricsRequest++; lyricsLoading=false; }
+      if(!type) return;
+      $('drawer-title').textContent=type==='lyrics'?'Synced Lyrics':type==='search'?'Search':'Up Next';
+      if(type==='lyrics') { lyricsFor=null; loadLyrics(state.current_track); }
+      else if(type==='queue') renderQueue(); else renderSearch();
+    }
+    function renderQueue() { const items=state.queue||[]; $('drawer-body').innerHTML=items.length ? items.map(item=>`<button class="queue-row" data-id="${escapeHtml(item.videoId||item.id)}"><img src="${escapeHtml(item.thumbnail||'')}" alt=""><div><strong>${escapeHtml(item.title||'Untitled')}</strong><span>${escapeHtml(item.artist||'')}</span></div></button>`).join('') : '<div class="empty">Your queue is empty.</div>'; [...document.querySelectorAll('.queue-row')].forEach((button)=>button.addEventListener('click',()=>{const item=items.find(track=>(track.videoId||track.id)===button.dataset.id); if(item) send('play_track',item); })); }
+    function renderLyrics() { const lines=state.lyrics||[]; $('drawer-body').innerHTML=lines.length ? lines.map(line=>`<div class="lyrics-line ${Number(line.time)<=Number(state.current_time)?'active':''}">${escapeHtml(line.text)}</div>`).join('') : (lyricsLoading ? '<div class="empty">Loading lyrics…</div>' : '<div class="empty">Lyrics are unavailable for this track.</div>'); }
+    async function loadLyrics(track) {
+      const id=track?.videoId||track?.id; if(!id) { lyricsLoading=false; lyricsFor=null; state.lyrics=[]; renderLyrics(); return; }
+      const requestId=++lyricsRequest; lyricsLoading=true; lyricsFor=id; state.lyrics=[]; renderLyrics();
+      try {
+        const params=new URLSearchParams({track_id:id,title:track.title||'',artist:track.artist||'',duration:String(state.duration||'')}); const data=await request('/api/lyrics?'+params);
+        if(requestId===lyricsRequest && (state.current_track?.videoId||state.current_track?.id)===id) state.lyrics=data.lines||[];
+      } catch { if(requestId===lyricsRequest) state.lyrics=[]; }
+      finally { if(requestId===lyricsRequest) { lyricsLoading=false; if(activeDrawer==='lyrics') renderLyrics(); } }
+    }
+    async function renderSearch() {
+      searchRequest++;
+      $('drawer-body').innerHTML='<form class="search-form" id="search-form"><input id="search-input" placeholder="Search YouTube Music" autocomplete="off"><button>Search</button></form><div id="search-results"></div>';
+      $('search-form').addEventListener('submit',async(event)=>{
+        event.preventDefault(); const query=$('search-input').value.trim(); if(!query)return;
+        const searchId=++searchRequest; $('search-results').innerHTML='<div class="empty">Searching…</div>';
+        try {
+          const data=await request('/api/search?q='+encodeURIComponent(query));
+          if(searchId!==searchRequest || activeDrawer!=='search') return;
+          const results=(data.songs||data.results||[]).slice(0,20); $('search-results').innerHTML=results.length ? results.map(item=>`<button class="search-result" data-id="${escapeHtml(item.videoId||item.id)}"><img src="${escapeHtml(item.thumbnail||'')}" alt=""><span><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.artist||'')}</small></span></button>`).join('') : '<div class="empty">No songs found.</div>';
+          [...document.querySelectorAll('.search-result')].forEach((button)=>button.addEventListener('click',()=>{const item=results.find(track=>(track.videoId||track.id)===button.dataset.id); if(item) { send('play_track',item); openDrawer(null); }}));
+        } catch { if(searchId===searchRequest && activeDrawer==='search') $('search-results').innerHTML='<div class="empty">Search unavailable.</div>'; }
+      });
+    }
+    $('play').onclick=()=>send('toggle_play'); $('previous').onclick=()=>send('previous'); $('next').onclick=()=>send('next'); $('shuffle').onclick=()=>send('toggle_shuffle'); $('repeat').onclick=()=>send('toggle_repeat'); $('lyrics-btn').onclick=()=>openDrawer('lyrics'); $('queue-btn').onclick=()=>openDrawer('queue'); $('drawer-close').onclick=()=>openDrawer(null); $('seek').onpointerdown=beginSeek; $('seek').ontouchstart=beginSeek; $('seek').oninput=()=>scheduleSeek($('seek').value); $('seek').onpointerup=endSeek; $('seek').ontouchend=endSeek; $('seek').onchange=endSeek; $('volume').oninput=()=>send('set_volume',Number($('volume').value)); document.querySelectorAll('[data-tab]').forEach((button)=>button.onclick=()=>button.dataset.tab==='search'?openDrawer('search'):openDrawer(null));
+    sync(); pollTimer=setInterval(sync,1000); window.addEventListener('pagehide',()=>{ clearInterval(pollTimer); clearTimeout(seekTimer); clearTimeout(toastTimer); });
+    if ('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('/mobile-sw.js',{scope:'/mobile'}).catch(()=>{}));
+  </script>
+</body>
+</html>

@@ -58,6 +58,15 @@ export function addToQueue(track) {
   queue.update(value => ({ ...value, upNext: [...value.upNext.filter(item => item.videoId !== track.videoId), track] }))
 }
 
+export function appendTracks(tracks) {
+  queue.update(value => {
+    const known = new Set([value.nowPlaying?.videoId, ...value.upNext.map(item => item.videoId)].filter(Boolean))
+    const fresh = (tracks || []).filter(item => item?.videoId && !known.has(item.videoId))
+    if (!fresh.length) return value
+    return { ...value, upNext: [...value.upNext, ...fresh] }
+  })
+}
+
 export function removeUpcoming(videoId) {
   queue.update(value => ({ ...value, upNext: value.upNext.filter(track => track.videoId !== videoId) }))
 }

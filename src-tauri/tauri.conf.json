@@ -40,6 +40,6 @@
       "icons/icon.png"
     ],
     "externalBin": ["binaries/ytm-backend"],
-    "resources": []
+    "resources": ["../backend"]
   }
 }

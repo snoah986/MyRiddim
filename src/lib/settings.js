@@ -7,6 +7,8 @@ const DEFAULTS = {
   cacheLimitMb: 1024,
   crossfade: false,
   crossfadeDuration: 4,
+  autoRadio: true,
+  scrobble: true,
   volumeNormalize: false,
   dynamicAmbient: true,
 }

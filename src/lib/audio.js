@@ -40,8 +40,21 @@ function ensure() {
   master.connect(normGain)
   normGain.connect(analyser)
   analyser.connect(ctx.destination)
+  // Keep the audio endpoint warm with a looping silent buffer so the
+  // hardware DAC never sleeps between tracks — Windows WASAPI resume adds a
+  // 200-400ms audible delay on the next play().
+  try {
+    const keepAlive = ctx.createBuffer(1, 1, 22050)
+    const keepAliveSource = ctx.createBufferSource()
+    keepAliveSource.buffer = keepAlive
+    keepAliveSource.loop = true
+    keepAliveSource.connect(ctx.destination)
+    keepAliveSource.start()
+  } catch { /* keep-alive is best-effort */ }
   for (const key of ['A', 'B']) {
     const el = new Audio()
+    el.preload = 'auto'
+    el.playsInline = true
     const gain = ctx.createGain()
     gain.gain.value = key === 'A' ? volume : 0
     ctx.createMediaElementSource(el).connect(gain)
@@ -94,33 +107,35 @@ function abortFade() {
 }
 
 function startFade() {
-  if (fading || !preloaded || !pendingSrc || !els.B.el.src) return
+  const outgoing = live
+  const incoming = otherOf(outgoing)
+  const incomingEl = els[incoming].el
+  if (fading || !preloaded || !pendingSrc || !incomingEl.src || incomingEl.readyState < 2) return
   fading = true
   const now = ctx.currentTime
-  els.A.gain.gain.cancelScheduledValues(now)
-  els.A.gain.gain.setValueAtTime(els.A.gain.gain.value, now)
-  els.A.gain.gain.linearRampToValueAtTime(0, now + fadeSeconds)
-  els.B.gain.gain.cancelScheduledValues(now)
-  els.B.gain.gain.setValueAtTime(0, now)
-  els.B.gain.gain.linearRampToValueAtTime(volume, now + fadeSeconds)
-  els.B.el.play().catch(() => abortFade())
+  els[outgoing].gain.gain.cancelScheduledValues(now)
+  els[outgoing].gain.gain.setValueAtTime(els[outgoing].gain.gain.value, now)
+  els[outgoing].gain.gain.linearRampToValueAtTime(0, now + fadeSeconds)
+  els[incoming].gain.gain.cancelScheduledValues(now)
+  els[incoming].gain.gain.setValueAtTime(0, now)
+  els[incoming].gain.gain.linearRampToValueAtTime(volume, now + fadeSeconds)
+  incomingEl.play().catch(() => abortFade())
   fadeTimer = setTimeout(() => {
     if (!fading) return
     fading = false
     gapFilled = true
-    live = 'B'
-    els.A.el.pause()
-    els.A.el.removeAttribute('src')
-    els.A.el.load()
-    els.A.gain.gain.cancelScheduledValues(ctx.currentTime)
-    els.A.gain.gain.setValueAtTime(0, ctx.currentTime)
-    els.B.gain.gain.cancelScheduledValues(ctx.currentTime)
-    els.B.gain.gain.setValueAtTime(volume, ctx.currentTime)
+    live = incoming
+    els[outgoing].el.pause()
+    els[outgoing].el.removeAttribute('src')
+    els[outgoing].el.load()
+    els[outgoing].gain.gain.cancelScheduledValues(ctx.currentTime)
+    els[outgoing].gain.gain.setValueAtTime(0, ctx.currentTime)
+    els[incoming].gain.gain.cancelScheduledValues(ctx.currentTime)
+    els[incoming].gain.gain.setValueAtTime(volume, ctx.currentTime)
     pendingSrc = null
     preloaded = false
-    // The old element never reaches its natural end, so synthesize it: the app
-    // advances the queue, and its playTrack() re-assigns the same URL, which the
-    // engine adopts without restarting (gapless).
+    // The outgoing element never reaches its natural end, so synthesize it:
+    // the app advances the queue and adopts the already-playing incoming URL.
     emit('ended')
   }, fadeSeconds * 1000)
 }
@@ -161,8 +176,9 @@ function setFade(seconds) {
 function onTimeUpdate() {
   const el = els[live].el
   if (fadeSeconds > 0 && pendingSrc && !preloaded && el.duration && el.duration - el.currentTime <= PRELOAD_WINDOW) {
+    const incoming = otherOf(live)
+    els[incoming].el.src = pendingSrc
     preloaded = true
-    els.B.el.src = pendingSrc
   }
   if (fadeSeconds > 0 && pendingSrc && preloaded && !fading && el.duration && el.duration - el.currentTime <= fadeSeconds) {
     startFade()
@@ -172,23 +188,44 @@ function onTimeUpdate() {
 
 function preload(url) {
   ensure()
-  if (fadeSeconds <= 0) return
+  if (fadeSeconds <= 0 || !url) return
   pendingSrc = url
   preloaded = false
   const el = els[live].el
   if (el.duration && el.duration - el.currentTime <= PRELOAD_WINDOW) {
+    const incoming = otherOf(live)
+    els[incoming].el.src = url
     preloaded = true
-    els.B.el.src = url
   }
+}
+
+// Stop both media elements and release their network buffers before a track
+// switch. This prevents a late media event or crossfade element from leaking
+// the previous track into the new session.
+function clear() {
+  ensure()
+  abortFade()
+  pendingSrc = null
+  preloaded = false
+  gapFilled = false
+  for (const key of ['A', 'B']) {
+    els[key].el.pause()
+    els[key].el.removeAttribute('src')
+    els[key].el.load()
+    els[key].gain.gain.cancelScheduledValues(ctx.currentTime)
+    els[key].gain.gain.setValueAtTime(key === live ? volume : 0, ctx.currentTime)
+  }
+  dataset.loadedTrackId = null
 }
 
 export const audio = {
   get src() { return els[live].el ? els[live].el.src : '' },
   set src(value) {
     ensure()
-    // Post-crossfade, the app re-assigns the URL B is already playing: adopt it
-    // instead of restarting, which is what makes playback gapless.
-    if (els.B.el.src === value && els.B.el.readyState >= 1) resetTo('B')
+    // Post-crossfade, the app re-assigns the URL already playing: adopt that
+    // element instead of restarting it. This works after either A→B or B→A.
+    const existing = ['A', 'B'].find(key => els[key].el.src === value && els[key].el.readyState >= 1)
+    if (gapFilled && existing) resetTo(existing)
     else resetTo('A', value)
   },
   get currentTime() { return els[live].el ? els[live].el.currentTime : 0 },
@@ -203,6 +240,12 @@ export const audio = {
   get volume() { return volume },
   set volume(value) { volume = value; if (master) master.gain.value = value },
   get dataset() { return dataset },
+  // Wake the audio pipeline synchronously: create the context and resume it
+  // inside the user gesture so media playback is never held up by async setup.
+  warm() {
+    ensure()
+    if (ctx.state === 'suspended') ctx.resume()
+  },
   play() {
     ensure()
     if (ctx.state === 'suspended') ctx.resume()
@@ -212,6 +255,7 @@ export const audio = {
     if (fading) abortFade()
     if (els[live].el) els[live].el.pause()
   },
+  clear,
   get gapFilled() { return gapFilled },
   preload,
   setFade,

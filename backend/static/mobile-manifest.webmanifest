@@ -1,0 +1,16 @@
+{
+  "name": "myriddim Remote",
+  "short_name": "myriddim",
+  "description": "Remote controls for the myriddim desktop music player.",
+  "id": "/mobile",
+  "start_url": "/mobile",
+  "scope": "/mobile",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d0b0a",
+  "theme_color": "#0d0b0a",
+  "lang": "en",
+  "icons": [
+    { "src": "/mobile-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

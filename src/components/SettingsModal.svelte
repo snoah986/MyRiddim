@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte'
   import { settings, updateSetting } from '../lib/settings.js'
+  import { apiFetch } from '../lib/api.js'
 
   export let onClose = () => {}
   export let onDisconnect = () => {}
@@ -12,11 +13,13 @@
 
   let cacheInfo = { count: 0, sizeBytes: 0 }
   let backendOk = false
+  let backendSession = 'ok'
   let clearing = false
   let cleared = false
   let savingLimit = false
   let limitSaved = false
   let authUploading = false
+  let accountName = ''
 
   const formatBytes = bytes => {
     if (!Number.isFinite(bytes)) return '0 B'
@@ -26,19 +29,27 @@
     while (value >= 1024 && i < units.length - 1) { value /= 1024; i += 1 }
     return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`
   }
-  const cachePct = () => $settings.cacheLimitMb > 0 ? Math.min(100, (cacheInfo.sizeBytes / ($settings.cacheLimitMb * 1024 * 1024)) * 100) : 0
+  const cacheBytes = () => cacheInfo.size_bytes ?? cacheInfo.sizeBytes ?? 0
+  const cachePct = () => $settings.cacheLimitMb > 0 ? Math.min(100, (cacheBytes() / ($settings.cacheLimitMb * 1024 * 1024)) * 100) : 0
 
   onMount(async () => {
     try {
-      const [settingsRes, healthRes] = await Promise.all([fetch('/api/settings'), fetch('/api/health')])
+      const [settingsRes, healthRes, accountRes] = await Promise.all([apiFetch('/api/settings'), apiFetch('/api/health'), apiFetch('/api/account')])
+      try {
+        const accountData = await accountRes.json()
+        if (accountData.authenticated && accountData.account?.name) accountName = accountData.account.name
+      } catch { /* account info is best-effort */ }
       if (settingsRes.ok) {
         const data = await settingsRes.json()
         if (data.cache) cacheInfo = data.cache
         if (data.cache_limit_bytes) updateSetting('cacheLimitMb', Math.max(16, Math.round(data.cache_limit_bytes / 1024 / 1024)))
+        if (data.quality) updateSetting('quality', data.quality)
       }
       // "expired" still means the backend itself is reachable (it reports the
       // lapsed session honestly), so it counts as online.
-      backendOk = healthRes.ok && ['ok', 'expired'].includes((await healthRes.json()).status)
+      const healthData = await healthRes.json()
+      backendOk = healthRes.ok && ['ok', 'expired'].includes(healthData.status)
+      backendSession = healthData.session || healthData.status
     } catch { backendOk = false }
   })
 
@@ -47,7 +58,7 @@
     if (!Number.isFinite(mb) || mb < 16 || mb > 65536) { onToast('Cache limit must be between 16 and 65536 MB'); return }
     savingLimit = true
     try {
-      const response = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cache_limit_bytes: Math.round(mb * 1024 * 1024) }) })
+      const response = await apiFetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cache_limit_bytes: Math.round(mb * 1024 * 1024) }) })
       if (!response.ok) throw Error()
       const data = await response.json()
       if (data.cache) cacheInfo = data.cache
@@ -60,7 +71,7 @@
   async function clearCache() {
     clearing = true
     try {
-      const response = await fetch('/api/settings/cache/clear', { method: 'POST' })
+      const response = await apiFetch('/api/settings/cache/clear', { method: 'POST' })
       if (!response.ok) throw Error()
       const data = await response.json()
       if (data.cache) cacheInfo = data.cache
@@ -75,7 +86,7 @@
     authUploading = true
     try {
       const text = await file.text()
-      const response = await fetch('/api/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auth: text }) })
+      const response = await apiFetch('/api/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auth: text }) })
       const data = await response.json()
       if (!response.ok || data.error) throw Error(data.error || 'Could not apply the new credentials')
       onToast('Credentials updated')
@@ -85,7 +96,7 @@
 
   async function exportStats() {
     try {
-      const response = await fetch('/api/stats/export')
+      const response = await apiFetch('/api/stats/export')
       if (!response.ok) throw Error()
       const data = await response.json()
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
@@ -139,6 +150,14 @@
           <input class="slider" type="range" min="0" max="12" step="0.5" value={$settings.crossfadeDuration} disabled={!$settings.crossfade} on:input={event => updateSetting('crossfadeDuration', Number(event.currentTarget.value))} aria-label="Crossfade duration in seconds" />
         </div>
         <div class="row">
+          <div class="row-label"><strong>Radio / auto-continue</strong><small>When the queue runs low, keeps playing related tracks from YouTube Music so the session never dead-ends.</small></div>
+          <label class="switch"><input type="checkbox" checked={$settings.autoRadio !== false} on:change={event => updateSetting('autoRadio', event.currentTarget.checked)} /><span></span></label>
+        </div>
+        <div class="row">
+          <div class="row-label"><strong>Report plays to YouTube Music</strong><small>Scrobbles each listen back to your account so Quick Picks and mixes learn from what you actually play.</small></div>
+          <label class="switch"><input type="checkbox" checked={$settings.scrobble !== false} on:change={event => updateSetting('scrobble', event.currentTarget.checked)} /><span></span></label>
+        </div>
+        <div class="row">
           <div class="row-label"><strong>Volume normalization</strong><small>Levels track loudness automatically via Web Audio (ReplayGain-style).</small></div>
           <label class="switch"><input type="checkbox" checked={$settings.volumeNormalize} on:change={event => updateSetting('volumeNormalize', event.currentTarget.checked)} /><span></span></label>
         </div>
@@ -161,10 +180,10 @@
       <section class="group">
         <h3 class="group-title">Storage &amp; Caching</h3>
         <div class="row">
-          <div class="row-label"><strong>Audio cache</strong><small>{cacheInfo.count} files · {formatBytes(cacheInfo.sizeBytes)}</small></div>
+          <div class="row-label"><strong>Audio cache</strong><small>{cacheInfo.count} files · {formatBytes(cacheBytes())}</small></div>
           <div class="cache-vis">
             <div class="cache-bar"><i style="width: {cachePct()}%"></i></div>
-            <span class="cache-copy">Using {formatBytes(cacheInfo.sizeBytes)} of {$settings.cacheLimitMb} MB limit</span>
+            <span class="cache-copy">Using {formatBytes(cacheBytes())} of {$settings.cacheLimitMb} MB limit</span>
           </div>
         </div>
         <div class="row sub">
@@ -185,8 +204,8 @@
       <section class="group">
         <h3 class="group-title">Account &amp; Session</h3>
         <div class="row">
-          <div class="row-label"><strong>YouTube Music</strong><small>Connected via <code>browser.json</code> session credentials.</small></div>
-          <span class="badge"><i></i>Connected</span>
+          <div class="row-label"><strong>YouTube Music</strong><small>{backendSession === 'expired' ? 'Session credentials have lapsed — reconnect to restore library access.' : (accountName ? `Connected as ${accountName}` : 'Connected via session credentials in the private user-data directory.')}</small></div>
+          <span class="badge" class:warn={backendSession === 'expired'}><i></i>{backendSession === 'expired' ? 'Session expired' : 'Connected'}</span>
         </div>
         <div class="row sub">
           <div class="row-label"><strong>Update credentials</strong><small>Replace the session by uploading a new <code>browser.json</code> file. No restart needed.</small></div>
@@ -270,7 +289,7 @@
   .ghost.danger:hover:not(:disabled) { background: #fca5a520; }
   .file-btn { position: relative; overflow: hidden; display: inline-block; }
   .file-btn input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-  .badge { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px; color: #86efac; background: #86efac14; font-size: .74rem; font-weight: 600; flex: 0 0 auto; }
+  .badge { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 999px; color: #86efac; background: #86efac14; font-size: .74rem; font-weight: 600; flex: 0 0 auto; } .badge.warn { color: #fbbf24; background: #fbbf2414; }
   .badge i { width: 7px; height: 7px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 8px #4ade80; }
   .badge.down { color: #fca5a5; background: #fca5a514; }
   .badge.down i { background: #f87171; box-shadow: 0 0 8px #f87171; }
