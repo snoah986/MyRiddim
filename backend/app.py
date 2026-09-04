@@ -2000,7 +2000,13 @@ def get_video_offset():
         with db_connection() as db:
             row = db.execute("SELECT video_id, intro_offset, source, estimated_delta FROM video_offsets WHERE video_id = ?", (video_id,)).fetchone()
         if row:
-            return jsonify({"video_id": video_id, "intro_offset": row["intro_offset"], "source": row["source"], "estimated_delta": row["estimated_delta"], "cached": True})
+            # Manual calibrations are authoritative. Automatic offsets created
+            # before the duration gate must be revalidated when the caller has
+            # the audio duration, otherwise an old SponsorBlock result could
+            # keep shifting an exact studio cut forever.
+            has_duration = parse_duration(request.args.get("audio_duration")) is not None
+            if row["source"] == "manual" or row["source"] == "exact_match" or not has_duration:
+                return jsonify({"video_id": video_id, "intro_offset": row["intro_offset"], "source": row["source"], "estimated_delta": row["estimated_delta"], "cached": True})
     except sqlite3.Error:
         pass
     meta_title, meta_artist = clean_track_meta(request.args.get("title"), request.args.get("artist"))
@@ -2026,10 +2032,10 @@ def save_video_offset():
         return jsonify({"error": "Invalid video id"}), 400
     try:
         offset = float(body.get("intro_offset", 0))
-        if not math.isfinite(offset) or offset < 0 or offset > 30:
+        if not math.isfinite(offset) or offset < -30 or offset > 30:
             raise ValueError
     except (TypeError, ValueError):
-        return jsonify({"error": "intro_offset must be between 0 and 30 seconds"}), 400
+        return jsonify({"error": "intro_offset must be between -30 and 30 seconds"}), 400
     source = clean(body.get("source")) or "manual"
     if source != "manual":
         source = "manual"

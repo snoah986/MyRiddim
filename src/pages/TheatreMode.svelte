@@ -571,6 +571,13 @@
 
   function loadTrackOffset(id) {
     manualOffset = 0
+    // Audio-mode lyrics always use their source timestamps. Never let a
+    // previously resolved companion-video offset leak into the studio cut.
+    if (!isVideoMode) {
+      videoOffset = 0
+      videoOffsetSource = 'none'
+      videoNeedsSync = false
+    }
     if (!id || isVideoMode) return
     try {
       const saved = localStorage.getItem(`lyric_offset_${id}`)
@@ -590,7 +597,7 @@
       const response = await apiFetch(`/api/video-offset?${params}`)
       const data = await response.json()
       if (requestId !== videoOffsetRequest || !response.ok) return
-      videoOffset = Math.max(0, Math.min(VIDEO_OFFSET_MAX, Number(data.intro_offset) || 0))
+      videoOffset = Math.max(-VIDEO_OFFSET_MAX, Math.min(VIDEO_OFFSET_MAX, Number(data.intro_offset) || 0))
       videoOffsetSource = data.source || 'none'
       videoNeedsSync = videoOffsetSource === 'needs_sync' || videoOffsetSource === 'delta_estimate'
       if (rawLyrics.length) { lyrics = applyVideoOffset(rawLyrics, videoOffset, videoNeedsSync); syncLyricsOnce() }
@@ -605,9 +612,12 @@
   }
 
   function saveVideoOffset(offset, source = 'manual') {
+    // Offset calibration belongs exclusively to the companion video timeline.
+    // Audio mode must remain at LRCLIB/YTM's original timestamps.
+    if (!isVideoMode) return
     const id = videoModeTrackId || companionVideoId
     if (!id) return
-    videoOffset = Math.max(0, Math.min(VIDEO_OFFSET_MAX, Number(offset) || 0))
+    videoOffset = Math.max(-VIDEO_OFFSET_MAX, Math.min(VIDEO_OFFSET_MAX, Number(offset) || 0))
     videoOffsetSource = source
     videoNeedsSync = false
     lyrics = applyVideoOffset(rawLyrics, videoOffset, false)
