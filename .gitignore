@@ -28,4 +28,8 @@ src-tauri/gen/
 Thumbs.db
 
 # --- Logs ---
-*.log
+*.logbuild/
+dist/
+src-tauri/target/
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
