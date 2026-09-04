@@ -150,8 +150,8 @@
           <input class="slider" type="range" min="0" max="12" step="0.5" value={$settings.crossfadeDuration} disabled={!$settings.crossfade} on:input={event => updateSetting('crossfadeDuration', Number(event.currentTarget.value))} aria-label="Crossfade duration in seconds" />
         </div>
         <div class="row">
-          <div class="row-label"><strong>Radio / auto-continue</strong><small>When the queue runs low, keeps playing related tracks from YouTube Music so the session never dead-ends.</small></div>
-          <label class="switch"><input type="checkbox" checked={$settings.autoRadio !== false} on:change={event => updateSetting('autoRadio', event.currentTarget.checked)} /><span></span></label>
+          <div class="row-label"><strong>Instant queue flush</strong><small>Use one click instead of holding the trash control for 0.8 seconds.</small></div>
+          <label class="switch"><input type="checkbox" checked={$settings.instantQueueFlush} on:change={event => updateSetting('instantQueueFlush', event.currentTarget.checked)} /><span></span></label>
         </div>
         <div class="row">
           <div class="row-label"><strong>Report plays to YouTube Music</strong><small>Scrobbles each listen back to your account so Quick Picks and mixes learn from what you actually play.</small></div>
@@ -160,6 +160,19 @@
         <div class="row">
           <div class="row-label"><strong>Volume normalization</strong><small>Levels track loudness automatically via Web Audio (ReplayGain-style).</small></div>
           <label class="switch"><input type="checkbox" checked={$settings.volumeNormalize} on:change={event => updateSetting('volumeNormalize', event.currentTarget.checked)} /><span></span></label>
+        </div>
+      </section>
+
+      <!-- App Shell -->
+      <section class="group">
+        <h3 class="group-title">App Shell</h3>
+        <div class="row">
+          <div class="row-label"><strong>Workspace layout</strong><small>Choose the navigation density that fits your screen.</small></div>
+          <div class="seg shell-seg" role="group" aria-label="Workspace layout">
+            <button class:active={$settings.shellLayout === 'sidebar'} on:click={() => updateSetting('shellLayout', 'sidebar')}>Sidebar</button>
+            <button class:active={$settings.shellLayout === 'topbar'} on:click={() => updateSetting('shellLayout', 'topbar')}>Topbar</button>
+            <button class:active={$settings.shellLayout === 'handheld'} on:click={() => updateSetting('shellLayout', 'handheld')}>Handheld</button>
+          </div>
         </div>
       </section>
 
@@ -265,6 +278,7 @@
   .seg button { padding: 7px 14px; border: 0; border-radius: 999px; color: #b8b8c0; background: transparent; cursor: pointer; font-size: .78rem; font-weight: 600; transition: all .18s ease; }
   .seg button:hover { color: #fff; }
   .seg button.active { color: #111; background: var(--accent, #c4b5fd); box-shadow: 0 2px 12px color-mix(in srgb, var(--accent, #c4b5fd) 45%, transparent); }
+  .shell-seg button { padding-inline: 10px; }
   .switch { position: relative; display: inline-flex; align-items: center; cursor: pointer; flex: 0 0 auto; }
   .switch input { position: absolute; opacity: 0; }
   .switch span { width: 42px; height: 24px; border-radius: 999px; background: #3a3a44; transition: background .2s ease; }

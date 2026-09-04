@@ -1,150 +1,153 @@
-# ytm-player — Local YouTube Music player
+# Freebuff Desktop / myriddim
 
-A local-first YouTube Music player: a Svelte frontend + a Flask backend that bridges
-the [ytmusicapi](https://github.com/tjws/ytmusicapi) library, with Theatre Mode,
-synced lyrics, gapless crossfade, a Web Audio visualizer, PWA support, and a
-Tauri desktop shell. **Everything runs on your machine** — no cloud, no accounts
-except your own YouTube Music session.
+A local-first YouTube Music desktop client: Svelte UI, a Flask/ytmusicapi bridge, a low-latency Web Audio player, and an optional Tauri 2 shell. It keeps credentials, listening history, and media cache on the user’s machine.
 
-> ⚠️ **Security**: the backend holds your real Google session cookies. It binds to
-> `127.0.0.1` only, validates all IDs, and rate-limits YouTube calls. Never expose
-> port `5178` to the network, and never commit `browser.json`.
+> **Status:** active development. `v1.2.0` is the latest committed release; the current checkout also contains a large, uncommitted feature pass. Treat unreleased features as experimental until they are split, tested, and committed.
 
----
+## Highlights
 
-## 1. Authentication (required)
+- **OLED Theatre Mode** — centered album art/video stage, sampled artwork mesh, synced lyrics, queue drawer, cinema fade, and crossfade-aware playback.
+- **Discovery** — YouTube Music shelves, related-artist exploration, Fresh Discoveries, and one-tap Start Mix.
+- **Party Jukebox** — host rooms, guest requests, voting, moderation, quotas, cooldowns, mobile guest UI, and a draft Cloudflare relay.
+- **Smart sync** — LRCLIB-first lyrics, YTM fallback, video intro offsets, manual calibration, YRC syllable timing, and a model-free cadence fallback.
+- **Local-first playback** — SQLite listening data, a bounded audio cache, same-origin stream proxying, Media Session controls, and dual-deck crossfade.
+- **Desktop shell** — frameless Tauri window, custom controls, tray menu, backend sidecar contract, and window-state persistence wiring.
 
-The app needs your YouTube Music session. Paste the contents of a
-[ytmusicapi](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html)
-`browser.json` (or raw copied request headers) into the setup screen the first
-time you launch. It is stored **outside the project tree** in the user data
-directory — `%APPDATA%\ytm-player\browser.json` on Windows,
-`~/.config/ytm-player/browser.json` on macOS/Linux (set `YTM_DATA_DIR` to
-override) — so the repo can never leak your session. Same for `oauth.json`.
-The backend migrates any legacy in-repo copies automatically on first launch.
+## Architecture
 
-If your session expires, the UI shows a "Session expired" banner — click
-**Re-authenticate in Settings**, then paste fresh credentials.
+```text
+┌──────────────────────────────┐
+│ Svelte 5 frontend             │
+│ App state · queue · Theatre   │
+│ shelves · lyrics · Media API  │
+└──────────────┬───────────────┘
+               │ HTTP / same-origin proxy
+┌──────────────▼───────────────┐
+│ Tauri 2 Rust shell (optional) │
+│ window · tray · sidecar       │
+└──────────────┬───────────────┘
+               │ localhost process
+┌──────────────▼───────────────┐
+│ Python Flask sidecar          │
+│ ytmusicapi · yt-dlp · SQLite  │
+│ streams · lyrics · party      │
+└──────────────┬───────────────┘
+               │ outbound, user-authorized providers
+       YouTube Music · LRCLIB · NetEase · SponsorBlock
+```
 
-## 2. Run as a local web app (no build tools needed)
+The backend is the authority for provider access, credentials, SQLite schemas, stream resolution, and HTTP contracts. `App.svelte` owns user-visible playback and navigation state; `lib/queue.js` owns queue transitions; `lib/audio.js` owns media decks and Web Audio; rendering components receive props and callbacks.
 
-Prerequisites: Node.js ≥ 18 and Python ≥ 3.10.
+## Requirements
+
+### Local web development
+
+- Node.js 18 or newer
+- Python 3.10 or newer
+- A valid YouTube Music `browser.json` or OAuth setup
+- Network access to YouTube Music and optional lyric providers
+
+### Tauri desktop builds
+
+- Rust stable via [rustup](https://rustup.rs/)
+- Windows: Visual Studio Desktop development with C++ / MSVC Build Tools
+- macOS: Xcode command-line tools
+- Linux: Tauri WebKitGTK dependencies; the CI workflow installs Ubuntu dependencies
+- PyInstaller for a bundled Python sidecar
+
+## Quick start
 
 ```bash
-# 1. Frontend dependencies
 npm install
+python -m pip install -r backend/requirements.txt
 
-# 2. Python backend dependencies
-pip install -r backend/requirements.txt   # flask, flask-cors, ytmusicapi, yt-dlp
-
-# 3. Terminal A — backend (port 5178)
+# Terminal A
 python backend/app.py
 
-# 4. Terminal B — frontend dev server (port 5173)
+# Terminal B
 npm run dev
 ```
 
-Open http://localhost:5173, paste your `browser.json`, and you're in.
+Open <http://localhost:5173>. On first launch, paste the contents of `browser.json` or use the OAuth flow. Credentials and statistics are stored outside the repository. Do not commit session data.
 
-### iPhone remote (optional LAN mode)
-
-The Flask backend serves a standalone, installable remote at `/mobile`. It is
-localhost-only by default. To use it from an iPhone on a trusted home network:
+## Tauri packaging
 
 ```bash
-# Windows PowerShell
-$env:YTM_BIND_HOST = "0.0.0.0"
-$env:YTM_CORS_ORIGINS = "http://192.168.1.45:5178"
-python backend/app.py
-```
-
-Replace `192.168.1.45` with the computer's LAN address, then open
-`http://192.168.1.45:5178/mobile` in Safari and choose **Share → Add to Home
-Screen**. The remote polls the desktop's live playback state and sends validated
-play, seek, volume, shuffle, repeat, previous, next, queue, search, and lyrics
-commands. Keep this on a trusted LAN or VPN only: exposing the backend publicly
-would expose the authenticated music session.
-
-`yt-dlp` resolves audio streams (standalone, unmerged formats — no `ffmpeg` needed).
-Optional extras: `js_engine` falls back to Node for signature challenges (Node is
-already present).
-
-## 3. Build & run as a Tauri desktop app
-
-Prerequisites: Rust toolchain + MSVC Build Tools (Windows), Node ≥ 18, Python ≥ 3.10.
-
-```bash
-# 1. Rust + MSVC
-#    - install https://rustup.rs
-#    - install "Desktop development with C++" via Visual Studio Installer
-
-# 2. JS dependencies (includes @tauri-apps/cli and @tauri-apps/api)
-npm install
-
-# 3. Generate app icons
+# Generate icons when needed
 node scripts/generate-tauri-icons.mjs
 
-# 4. Package the Python backend as a sidecar (optional; without it the app
-#    falls back to launching `python backend/app.py` from the project dir)
-#    pip install pyinstaller -r backend/requirements.txt
-#    pyinstaller --onefile --name ytm-backend backend/app.py
-#    cp dist/ytm-backend(.exe) src-tauri/binaries/ytm-backend-<TARGET-TRIPLE>
-#    (Tauri requires the target-triple suffix, e.g. ytm-backend-x86_64-pc-windows-msvc.exe)
+# Build a target-specific sidecar (requires PyInstaller)
+python scripts/build_sidecar.py
 
-# 5. Dev run (Tauri starts Vite and the Python fallback automatically)
+# Development desktop shell
 npm run tauri dev
 
-# 6. Release build → src-tauri/target/release/bundle/
+# Release bundles
 npm run tauri build
 ```
 
-### How the desktop shell works
+`src-tauri/tauri.conf.json` disables native decorations, points Tauri at the Vite frontend, declares `binaries/ytm-backend` as an external binary, and includes the backend resource. `src-tauri/src/lib.rs` first attempts the sidecar and then falls back to `python backend/app.py` in a source checkout. The Windows installer workflow is under `.github/workflows/`; inspect the audit before relying on it for a release because multiple workflow drafts currently use different sidecar names and targets.
 
-- `src-tauri/tauri.conf.json` — window (1200×800, frameless with custom controls),
-  frontend build, and sidecar (`externalBin: ytm-backend`) wiring.
-- `src-tauri/src/lib.rs` — on startup, spawns the backend: first the bundled
-  sidecar binary, falling back to `python backend/app.py`; passes the fixed local
-  port and app-data directory; kills it on restart and application exit.
-- `src/components/WindowControls.svelte` — minimize / maximize / close buttons in
-  the header; rendered only inside the Tauri window (browser builds ignore them).
-- Media keys (Play/Pause/Next/Previous) work via the browser **Media Session API**
-  — available in both the web and desktop shells. Windows taskbar controls still
-  require a native media-session integration and are not claimed as implemented.
+## Configuration
 
-## 4. Project layout
+| Variable | Default | Used by | Purpose |
+| --- | --- | --- | --- |
+| `YTM_BIND_HOST` | `127.0.0.1` | `backend/app.py` | Flask bind address. Use `0.0.0.0` only on a trusted LAN/VPN for the mobile remote. |
+| `YTM_BACKEND_PORT` | `5178` | Flask, Tauri launcher, invite URL | Local backend port. Keep it private when credentials are loaded. |
+| `YTM_CORS_ORIGINS` | empty | `backend/app.py` | Comma-separated additional allowed origins. The app adds its local frontend/Tauri origins. |
+| `YTM_DATA_DIR` | platform user config directory | `backend/app.py` | Override the directory for `browser.json`, `oauth.json`, `stats.db`, settings, library cache, and audio cache. |
+| `PYTHONUNBUFFERED` | unset | Tauri sidecar launcher | Set to `1` by the Rust shell for readable sidecar logs. |
 
+`PARTY_RELAY_URL` is not currently consumed by the runtime; the relay source is a separate deployment draft and should not be documented as an active configuration path until hybrid routing is wired.
+
+## Data and privacy
+
+- Windows default: `%APPDATA%\\ytm-player\\`
+- macOS/Linux default: `~/.config/ytm-player/`
+- `browser.json` / `oauth.json`: YouTube session credentials
+- `stats.db`: listening events, features, palettes, and persisted resolver offsets
+- `audio_cache/`: local LRU-capped media cache; the default cap is 1 GiB
+- `settings.json`: quality and cache settings
+
+The backend defaults to `127.0.0.1`, applies input validation and rate limits, and restricts CORS origins. LAN mode exposes authenticated endpoints to the local network, so use a trusted network and narrow `YTM_CORS_ORIGINS`.
+
+## Repository map
+
+```text
+backend/app.py                 Flask routes, provider adapters, SQLite setup, streams
+backend/lyrics_yrc.py          Low-memory YRC ingestion and cadence fallback
+backend/party.py               In-memory Party Mode room/state engine
+backend/radio.py               Radio payload normalization and duplicate policy
+src/App.svelte                 Application state owner and shell composition
+src/lib/audio.js               Dual media decks, Web Audio, crossfade, analyser
+src/lib/queue.js               Queue state transitions and local persistence
+src/lib/mix.js                 Cancellable radio requests and deduplication
+src/lib/lyrics.js               Lyrics metadata and video-offset transformations
+src/lib/cadence_engine.js      Browser-side model-free cadence fallback
+src/pages/TheatreMode.svelte   Theatre stage, lyrics, queue drawer, video mode
+src/components/KaraokeLyrics.svelte  rAF-driven syllable rendering
+src-tauri/src/lib.rs           Tauri process, tray, and window-state lifecycle
+party-relay/                   Cloudflare Durable Object relay draft
+scripts/build_sidecar.py       PyInstaller sidecar helper
 ```
-backend/app.py            Flask bridge and HTTP adapters (auth, playlists, search, streams, lyrics, stats, cache)
-backend/radio.py          Pure radio-response normalization and duplicate policy
-src/                      Svelte 5 frontend
-  App.svelte              UI state owner: current track, queue connection, toasts, and view routing
-  lib/tracks.js           Pure playable-track identity normalization
-  lib/mix.js              Radio request engine: cancellation, stale-response guards, normalization, deduplication
-  lib/queue.js            Queue store and queue transitions (persisted to localStorage)
-  lib/audio.js            Web Audio engine: crossfade, visualizer, normalization
-  lib/settings.js         Settings store (persisted to localStorage)
-  components/             Rendering-only controls and shelves, including StartMixButton and TrackContextMenu
-  pages/                  Entity and player views (SongPage, ArtistPage, AlbumPage, TheatreMode)
-src-tauri/                Tauri 2 desktop shell + sidecar contract
-public/                   PWA manifest, service worker, icons
+
+## Verification
+
+The package defines only `dev`, `build`, `preview`, and `tauri`; it does not define a JavaScript linter or test script. The minimum local checks are:
+
+```bash
+npm run build
+python -m py_compile backend/app.py backend/lyrics_yrc.py
+node --check party-relay/worker.js
+git diff --check
 ```
 
-### State ownership and data flow
+For provider-dependent behavior, use isolated Flask test-client probes with mocked ytmusicapi/yt-dlp responses. Never use real account mutation calls as a build test.
 
-`App.svelte` owns user-visible application state and passes callbacks down to
-rendering components. Components emit intent; `App.svelte` delegates pure track
-policy to `lib/tracks.js`, asynchronous radio work to `lib/mix.js`, and queue
-transitions to `lib/queue.js`. The backend owns provider access and HTTP
-contracts; `backend/radio.py` normalizes provider payloads before the route
-returns them. Data flows upward as callbacks/events and downward as props, with
-no component owning a second copy of queue or playback state.
+## Contributing
 
-## 5. Data & privacy
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change. Security and architecture findings are tracked in [AUDIT_AND_RECOMMENDATIONS.md](AUDIT_AND_RECOMMENDATIONS.md). Release history is in [CHANGELOG.md](CHANGELOG.md).
 
-- `browser.json` / `oauth.json` — your YouTube session credentials, kept
-  **outside the repo** in the user data directory (see §1). Never inside the tree.
-- `stats.db` — listening history used for the Monthly Recap / Heavy Rotation
-  shelves; exportable as JSON from Settings. Also stored outside the repo in the
-  user data directory.
-- `.freebuff/audio_cache/` — LRU-capped (default 1 GB, configurable in Settings)
-  cache of recently played audio so repeat plays skip yt-dlp. Git-ignored.
+## License
+
+No project license has been declared yet. Treat the repository as all-rights-reserved until a license is added.

@@ -28,7 +28,7 @@ export function hydrateQueue() {
 
 export function seed(tracks, index = 0) {
   const list = tracks || []
-  queue.set({ history: [], nowPlaying: list[index] || null, upNext: list.slice(index + 1), repeat: 'off', shuffle: false })
+  queue.set({ history: [], nowPlaying: list[index] || null, upNext: list.slice(index + 1).map(track => ({ ...track, queueSource: track.queueSource || 'radio' })), repeat: 'off', shuffle: false })
 }
 
 export function selectNext() {
@@ -51,17 +51,19 @@ export function playUpcoming(track) {
 }
 
 export function playNext(track) {
-  queue.update(value => ({ ...value, upNext: [track, ...value.upNext.filter(item => item.videoId !== track.videoId)] }))
+  const queued = { ...track, queueSource: 'manual' }
+  queue.update(value => ({ ...value, upNext: [queued, ...value.upNext.filter(item => item.videoId !== queued.videoId)] }))
 }
 
 export function addToQueue(track) {
-  queue.update(value => ({ ...value, upNext: [...value.upNext.filter(item => item.videoId !== track.videoId), track] }))
+  const queued = { ...track, queueSource: 'manual' }
+  queue.update(value => ({ ...value, upNext: [...value.upNext.filter(item => item.videoId !== queued.videoId), queued] }))
 }
 
 export function appendTracks(tracks) {
   queue.update(value => {
     const known = new Set([value.nowPlaying?.videoId, ...value.upNext.map(item => item.videoId)].filter(Boolean))
-    const fresh = (tracks || []).filter(item => item?.videoId && !known.has(item.videoId))
+    const fresh = (tracks || []).filter(item => item?.videoId && !known.has(item.videoId)).map(item => ({ ...item, queueSource: item.queueSource || 'radio' }))
     if (!fresh.length) return value
     return { ...value, upNext: [...value.upNext, ...fresh] }
   })
@@ -73,6 +75,16 @@ export function removeUpcoming(videoId) {
 
 export function clearUpcoming() {
   queue.update(value => ({ ...value, upNext: [] }))
+}
+
+// Smart flush removes only tracks explicitly added by the listener. Tracks
+// supplied by radio/mix backfill remain in Up Next, so the queue never loses
+// its continuous listening path.
+export function clearManualUpcoming() {
+  queue.update(value => ({
+    ...value,
+    upNext: value.upNext.filter(track => track?.queueSource !== 'manual'),
+  }))
 }
 
 export function reorderUpcoming(from, to) {

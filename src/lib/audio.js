@@ -16,12 +16,14 @@ const els = { A: { el: null, gain: null }, B: { el: null, gain: null } }
 let live = 'A'          // element whose timeline/events are exposed to the UI
 let volume = 1
 let pendingSrc = null   // next track stream URL (from preload)
+let pendingTrackId = null
 let preloaded = false   // pendingSrc applied to els.B
 let fading = false
 let fadeTimer = null
 let gapFilled = false   // true right after a crossfade: the next track is already playing
+let gapFilledTrackId = null
 const dataset = { track: null }
-const handlers = { play: [], pause: [], timeupdate: [], loadedmetadata: [], ended: [], error: [] }
+const handlers = { play: [], playing: [], pause: [], timeupdate: [], loadedmetadata: [], ended: [], error: [] }
 
 const otherOf = which => (which === 'A' ? 'B' : 'A')
 const isLive = el => els[live].el === el
@@ -62,6 +64,7 @@ function ensure() {
     els[key].el = el
     els[key].gain = gain
     el.addEventListener('play', () => { if (isLive(el)) emit('play') })
+    el.addEventListener('playing', () => { if (isLive(el)) emit('playing') })
     el.addEventListener('pause', () => { if (isLive(el)) emit('pause') })
     el.addEventListener('timeupdate', onTimeUpdate)
     el.addEventListener('loadedmetadata', () => { if (isLive(el)) emit('loadedmetadata') })
@@ -76,8 +79,10 @@ function resetTo(which, url) {
   if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null }
   fading = false
   pendingSrc = null
+  pendingTrackId = null
   preloaded = false
   gapFilled = false
+  gapFilledTrackId = null
   live = which
   const other = otherOf(which)
   els[other].el.pause()
@@ -103,6 +108,8 @@ function abortFade() {
   els[other].el.pause()
   els[other].el.removeAttribute('src')
   els[other].el.load()
+  pendingSrc = null
+  pendingTrackId = null
   preloaded = false
 }
 
@@ -123,7 +130,8 @@ function startFade() {
   fadeTimer = setTimeout(() => {
     if (!fading) return
     fading = false
-    gapFilled = true
+    gapFilled = !!pendingTrackId
+    gapFilledTrackId = pendingTrackId
     live = incoming
     els[outgoing].el.pause()
     els[outgoing].el.removeAttribute('src')
@@ -133,11 +141,27 @@ function startFade() {
     els[incoming].gain.gain.cancelScheduledValues(ctx.currentTime)
     els[incoming].gain.gain.setValueAtTime(volume, ctx.currentTime)
     pendingSrc = null
+    pendingTrackId = null
     preloaded = false
     // The outgoing element never reaches its natural end, so synthesize it:
     // the app advances the queue and adopts the already-playing incoming URL.
     emit('ended')
   }, fadeSeconds * 1000)
+}
+
+// Commit the already-audible incoming deck as the current track without
+// touching its transport position or source. The queue layer calls this after
+// its now-playing state advances in response to the synthetic ended event.
+function adoptGapless(trackId) {
+  if (!gapFilled || !trackId || trackId !== gapFilledTrackId) return false
+  gapFilled = false
+  gapFilledTrackId = null
+  dataset.currentTrackId = trackId
+  dataset.loadedTrackId = trackId
+  emit('loadedmetadata')
+  emit('playing')
+  emit('timeupdate')
+  return true
 }
 
 // Track-loudness normalization: every 250ms, compare the analyser's RMS level
@@ -186,10 +210,11 @@ function onTimeUpdate() {
   emit('timeupdate')
 }
 
-function preload(url) {
+function preload(url, trackId = null) {
   ensure()
   if (fadeSeconds <= 0 || !url) return
   pendingSrc = url
+  pendingTrackId = trackId || null
   preloaded = false
   const el = els[live].el
   if (el.duration && el.duration - el.currentTime <= PRELOAD_WINDOW) {
@@ -206,8 +231,10 @@ function clear() {
   ensure()
   abortFade()
   pendingSrc = null
+  pendingTrackId = null
   preloaded = false
   gapFilled = false
+  gapFilledTrackId = null
   for (const key of ['A', 'B']) {
     els[key].el.pause()
     els[key].el.removeAttribute('src')
@@ -216,6 +243,11 @@ function clear() {
     els[key].gain.gain.setValueAtTime(key === live ? volume : 0, ctx.currentTime)
   }
   dataset.loadedTrackId = null
+}
+
+export function getActiveAudio() {
+  ensure()
+  return els[live].el
 }
 
 export const audio = {
@@ -256,6 +288,7 @@ export const audio = {
     if (els[live].el) els[live].el.pause()
   },
   clear,
+  adoptGapless,
   get gapFilled() { return gapFilled },
   preload,
   setFade,

@@ -8,9 +8,11 @@ const DEFAULTS = {
   crossfade: false,
   crossfadeDuration: 4,
   autoRadio: true,
+  instantQueueFlush: false,
   scrobble: true,
   volumeNormalize: false,
   dynamicAmbient: true,
+  shellLayout: 'sidebar',
 }
 
 function load() {

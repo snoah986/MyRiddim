@@ -7,11 +7,13 @@ import sqlite3
 import re
 import hashlib
 import math
+import socket
 import threading
 import time
 import traceback
 import urllib.parse
 import urllib.request
+import urllib.error
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
@@ -23,10 +25,14 @@ try:
     from .matcher import backfill_listens, ingest_track
     from .providers.soundcloud import SoundCloudProvider
     from .radio import normalize_radio_tracks
+    from .party import PARTY_STORE, PartyStore
+    from .lyrics_yrc import build_cadence_lines, fetch_netease_yrc
 except ImportError:
     from matcher import backfill_listens, ingest_track
     from providers.soundcloud import SoundCloudProvider
     from radio import normalize_radio_tracks
+    from party import PARTY_STORE, PartyStore
+    from lyrics_yrc import build_cadence_lines, fetch_netease_yrc
 
 app = Flask(__name__)
 
@@ -70,6 +76,220 @@ CORS(app, origins=[
 ] + [origin.strip().rstrip('/') for origin in os.getenv('YTM_CORS_ORIGINS', '').split(',') if origin.strip()])
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+@app.get("/api/party/state")
+def party_state():
+    """Full party snapshot for the host UI (and guest sync via ?code=)."""
+    code = clean(request.args.get("code"))
+    room = PARTY_STORE.get_room(code) if code else None
+    if not room:
+        return jsonify({"active": False})
+    return jsonify({"active": True, **room.public_state()})
+
+
+@app.post("/api/party/create")
+def party_create():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.create_room(clean(data.get("host_name")) or "Host")
+    return jsonify({"code": room.code, "invite_url": party_invite_url(room.code), **room.public_state()}), 201
+
+
+def _lan_ip():
+    """Best-effort LAN address guests can reach (UDP connect probes the route
+    without sending packets). Falls back to localhost when offline."""
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        try:
+            if sock:
+                sock.close()
+        except OSError:
+            pass
+
+
+def party_invite_url(code):
+    port = os.getenv("YTM_BACKEND_PORT", "5178")
+    return f"http://{_lan_ip()}:{port}/mobile?party={code}"
+
+
+@app.post("/api/party/close")
+def party_close():
+    data = request.get_json(silent=True) or {}
+    closed = PARTY_STORE.close_room(clean(data.get("code")))
+    if not closed:
+        return jsonify({"error": "Room not found"}), 404
+    return jsonify({"success": True})
+
+
+def _party_room_and_guest():
+    """Shared guard: resolve room + guest, touch liveness. Returns (room, guest, error_response)."""
+    code = clean(request.args.get("code") or (request.get_json(silent=True) or {}).get("code"))
+    guest_id = clean(request.args.get("guest_id") or (request.get_json(silent=True) or {}).get("guest_id"))
+    room = PARTY_STORE.get_room(code)
+    if not room:
+        return None, None, (jsonify({"error": "Room not found"}), 404)
+    guest = PartyStore.touch(room, guest_id) if guest_id else None
+    if not guest:
+        return room, None, (jsonify({"error": "Unknown guest — rejoin the party", "rejoin": True}), 401)
+    return room, guest, None
+
+
+@app.post("/api/party/join")
+def party_join():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    guest = PartyStore.join(room, clean(data.get("name")))
+    return jsonify({"guest_id": guest.id, "name": guest.name, **room.public_state()}), 201
+
+
+@app.get("/api/party/queue")
+def party_queue_for_guest():
+    room, guest, error = _party_room_and_guest()
+    if error:
+        return error
+    return jsonify({
+        "guest": guest.to_dict(),
+        "remaining_cooldown": room.remaining_cooldown(guest),
+        "unplayed_count": room.unplayed_count(guest.id),
+        "quota": room.settings["max_unplayed_per_guest"] if room.settings["max_unplayed_per_guest"] else None,
+        **room.public_state(),
+    })
+
+
+@app.post("/api/party/request")
+def party_request_track():
+    """A guest asks for a track. Returns playback commands when auto-approved."""
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    guest = PartyStore.touch(room, clean(data.get("guest_id")))
+    if not guest:
+        return jsonify({"error": "Unknown guest — rejoin the party", "rejoin": True}), 401
+    track = data.get("track")
+    if not isinstance(track, dict):
+        return jsonify({"error": "Track must be an object"}), 400
+    entry, error = PartyStore.request_track(room, guest, track)
+    if error:
+        return jsonify({"error": error, "remaining_cooldown": room.remaining_cooldown(guest)}), 429
+    commands = []
+    if entry["status"] == "queued":
+        commands = [{"action": "add_to_queue", "payload": {
+            "videoId": entry["videoId"], "title": entry["title"], "artist": entry["artist"],
+            "thumbnail": entry["thumbnail"], "duration": entry["duration"],
+        }}]
+        # Party transitions must stay gapless: start buffering the audio the
+        # moment a request is auto-approved.
+        download_to_cache(entry["videoId"], auth_headers())
+    return jsonify({"entry": entry, "commands": commands, **room.public_state()}), 201
+
+
+@app.post("/api/party/vote")
+def party_vote():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    guest = PartyStore.touch(room, clean(data.get("guest_id")))
+    if not guest:
+        return jsonify({"error": "Unknown guest — rejoin the party", "rejoin": True}), 401
+    votes = PartyStore.upvote(room, clean(data.get("video_id")), guest)
+    if votes is None:
+        return jsonify({"error": "Voting not allowed for your role"}), 403
+    return jsonify({"votes": votes, **room.public_state()})
+
+
+@app.post("/api/party/approve")
+def party_approve():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    entry = PartyStore.approve(room, clean(data.get("video_id")))
+    if not entry:
+        return jsonify({"error": "Nothing to approve"}), 404
+    commands = [{"action": "add_to_queue", "payload": {
+        "videoId": entry["videoId"], "title": entry["title"], "artist": entry["artist"],
+        "thumbnail": entry["thumbnail"], "duration": entry["duration"],
+    }}]
+    # Approved tracks join the live queue: pre-cache so the transition is gapless.
+    download_to_cache(entry["videoId"], auth_headers())
+    return jsonify({"entry": entry, "commands": commands, **room.public_state()})
+
+
+@app.post("/api/party/reject")
+def party_reject():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    if not PartyStore.reject(room, clean(data.get("video_id"))):
+        return jsonify({"error": "Nothing to reject"}), 404
+    return jsonify({"success": True, **room.public_state()})
+
+
+@app.post("/api/party/role")
+def party_set_role():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    if not PartyStore.set_role(room, clean(data.get("guest_id")), clean(data.get("role"))):
+        return jsonify({"error": "Unknown guest or role"}), 404
+    return jsonify({"success": True, **room.public_state()})
+
+
+@app.post("/api/party/kick")
+def party_kick():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    if not PartyStore.kick(room, clean(data.get("guest_id"))):
+        return jsonify({"error": "Unknown guest"}), 404
+    return jsonify({"success": True, **room.public_state()})
+
+
+@app.post("/api/party/settings")
+def party_settings():
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    updates = data.get("settings")
+    if not isinstance(updates, dict):
+        return jsonify({"error": "settings must be an object"}), 400
+    with room.lock:
+        if "require_approval" in updates:
+            room.settings["require_approval"] = bool(updates["require_approval"])
+        if "democratic_upvoting" in updates:
+            room.settings["democratic_upvoting"] = bool(updates["democratic_upvoting"])
+        for key in ("max_unplayed_per_guest", "cooldown_seconds"):
+            if key in updates:
+                try:
+                    room.settings[key] = max(0, int(updates[key]))
+                except (TypeError, ValueError):
+                    pass
+    return jsonify({"success": True, **room.public_state()})
+
+
+@app.post("/api/party/played")
+def party_mark_played():
+    """Host frontend reports the now-playing track so quotas/free the slot."""
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    PartyStore.mark_played(room, clean(data.get("video_id")))
+    return jsonify({"success": True, **room.public_state()})
 
 
 def _user_data_dir():
@@ -388,6 +608,31 @@ def init_stats_db():
             track_limit INTEGER NOT NULL DEFAULT 50,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS video_resolutions (
+            audio_video_id TEXT PRIMARY KEY,
+            music_video_id TEXT,
+            title TEXT,
+            artist TEXT,
+            source TEXT NOT NULL,
+            resolved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS video_offsets (
+            video_id TEXT PRIMARY KEY,
+            intro_offset REAL NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'none',
+            estimated_delta REAL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        # Older installs may already have video_offsets without the metadata
+        # columns added by the intro-sync feature. Keep those databases usable
+        # without dropping the user's permanent calibrations.
+        offset_columns = {row[1] for row in db.execute("PRAGMA table_info(video_offsets)").fetchall()}
+        for column, definition in (("intro_offset", "REAL NOT NULL DEFAULT 0"),
+                                   ("source", "TEXT NOT NULL DEFAULT 'none'"),
+                                   ("estimated_delta", "REAL"),
+                                   ("updated_at", "TIMESTAMP")):
+            if column not in offset_columns:
+                db.execute(f"ALTER TABLE video_offsets ADD COLUMN {column} {definition}")
         # Canonical entities retain one row per normalized recording while
         # track_sources preserves every provider-specific playable identity.
         db.execute("""CREATE TABLE IF NOT EXISTS canonical_tracks (
@@ -687,6 +932,17 @@ def auth_headers():
                     if key.lower().replace("_", "-") in ("cookie", "user-agent") and value}
     return {}
 
+def clean_track_meta(title, artist):
+    """Normalize music metadata before catalog/lyrics lookups."""
+    clean_title = clean(title)
+    clean_title = re.sub(r"\s*[\(\[](?:feat\.|ft\.|with).*?[\)\]]", "", clean_title, flags=re.I)
+    clean_title = re.sub(r"\s*[\(\[](?:(?:official\s*(?:music\s*)?(?:video|audio))|visualizer|lyrics?|hd|4k|remastered).*?[\)\]]", "", clean_title, flags=re.I)
+    clean_title = re.sub(r"\s+-\s+.*$", "", clean_title).strip()
+    clean_artist = re.sub(r"\s*-\s*Topic(?=\s*(?:,|$))", "", clean(artist), flags=re.I)
+    clean_artist = re.sub(r",.*$", "", clean_artist).strip()
+    return clean_title, clean_artist
+
+
 def parse_lrc(text):
     lines = []
     for raw in (text or "").splitlines():
@@ -701,18 +957,19 @@ def api_error(exc, status=502):
     return jsonify({"error": str(exc), "hint": "Add valid ytmusicapi browser headers and try again."}), status
 
 def search_item(item, forced_kind=None):
+    if not isinstance(item, dict):
+        return None
     kind = forced_kind or item.get("resultType", "song")
     # ytmusicapi uses singular resultType values, while a few versions return
     # a filter-shaped value. Keep the frontend contract stable regardless of
     # which response shape the installed client emits.
     kind = {"songs": "song", "artists": "artist", "albums": "album", "playlists": "playlist"}.get(kind, kind)
-    artists = item.get("artists") or []
-    artist_names = ", ".join(clean(a.get("name")) for a in artists if isinstance(a, dict))
-    artist_name = artist_names or clean(item.get("artist"))
-    artist_id = next((clean(a.get("id")) for a in artists if isinstance(a, dict) and a.get("id")), None)
+    artists = item.get("artists") or item.get("artist") or item.get("author") or []
+    artist_name = _first_artist(artists)
+    artist_id = next((clean(a.get("id")) for a in artists if isinstance(a, dict) and a.get("id")), None) if isinstance(artists, list) else None
     album = item.get("album")
-    album_name = clean(album.get("name")) if isinstance(album, dict) else clean(album)
-    video_id = clean(item.get("videoId"))
+    album_name = clean(_field_text(album))
+    video_id = clean(item.get("videoId") or item.get("id"))
     browse_id = clean(item.get("browseId") or item.get("playlistId"))
     if kind == "artist" and not browse_id:
         # Artists surface their channel as browseId in some API versions; use it
@@ -720,13 +977,16 @@ def search_item(item, forced_kind=None):
         # video/shelf results would collide with the artist card's id.
         browse_id = artist_id
     album_id = clean(album.get("id")) if isinstance(album, dict) else None
-    value = {"id": video_id if kind == "song" else browse_id,
-             "type": kind, "title": clean(item.get("title")) or clean(item.get("name")) or (artist_name if kind == "artist" else ""),
-             "artist": artist_name, "artistId": artist_id,
-             "album": album_name, "albumId": album_id, "thumbnail": thumbnail(item.get("thumbnails"))}
+    normalized = normalize_track(item) if kind == "song" else None
+    if kind == "song" and not normalized:
+        return None
+    value = {"id": normalized["videoId"] if normalized else (video_id if kind == "song" else browse_id),
+             "type": kind, "title": normalized["title"] if normalized else (clean(_field_text(item.get("title"))) or clean(_field_text(item.get("name"))) or (artist_name if kind == "artist" else "")),
+             "artist": normalized["artist"] if normalized else artist_name, "artistId": artist_id,
+             "album": album_name, "albumId": album_id, "thumbnail": normalized["thumbnail"] if normalized else _thumbnail_url(item.get("thumbnails") or item.get("thumbnail"))}
     if kind == "song":
-        value["videoId"] = video_id
-        value["duration"] = clean(item.get("duration"))
+        value["videoId"] = normalized["videoId"]
+        value["duration"] = normalized["duration"]
     return value
 
 @app.get("/api/search")
@@ -743,8 +1003,8 @@ def search():
     try:
         if filter_name:
             raw_results = client.search(query, filter=filter_name)
-            items = [search_item(item, filter_name[:-1] if filter_name.endswith("s") else filter_name)
-                     for item in raw_results]
+            items = [item for item in (search_item(raw, filter_name[:-1] if filter_name.endswith("s") else filter_name)
+                                      for raw in raw_results) if item]
         else:
             # One broad search is not enough: YouTube Music tends to fill it
             # with songs and silently omit artists/albums. Fetch each catalog
@@ -764,12 +1024,13 @@ def search():
                     # Keep the useful categories if one filter is unsupported
                     # by a particular ytmusicapi/YouTube response.
                     failures.append(f"{api_filter}: {category_error}")
-            items = groups
+            items = [item for item in groups if item]
             if not items and failures:
                 raise RuntimeError("No searchable result categories were available")
         # Artist results without any channel ID are un-navigable: drop them so
         # the shelf never renders a card that cannot open its artist page.
-        items = [item for item in items if not (item["type"] == "artist" and not item["id"])]
+        items = [item for item in items if item and not (item["type"] == "artist" and not item["id"])
+                and not (item["type"] == "song" and normalize_track(item) is None)]
         return jsonify({"query": query, "results": items,
                         "songs": [item for item in items if item["type"] == "song"],
                         "artists": [item for item in items if item["type"] == "artist"],
@@ -892,22 +1153,105 @@ def clean(value):
     """Normalize metadata from YouTube's inconsistent text fields."""
     return " ".join(str(value or "").replace("\\n", " ").replace("\\r", " ").replace("\\t", " ").split()).strip()
 
-def track_data(track):
-    artists = ", ".join(clean(a.get("name")) for a in track.get("artists", []) if a.get("name"))
-    artist_list = [a for a in track.get("artists", []) if isinstance(a, dict) and a.get("id")]
-    album = track.get("album")
-    album_name = clean(album.get("name")) if isinstance(album, dict) else clean(album)
-    album_id = clean(album.get("id")) if isinstance(album, dict) else None
+def _field_text(value):
+    """Extract display text from the shapes returned by YT Music and yt-dlp."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        if value.get("text") is not None:
+            return _field_text(value.get("text"))
+        runs = value.get("runs")
+        if isinstance(runs, list):
+            return "".join(_field_text(run) for run in runs if isinstance(run, dict) or isinstance(run, str))
+        for key in ("name", "title", "label", "simpleText"):
+            if value.get(key) is not None:
+                return _field_text(value[key])
+    return ""
+
+
+def _first_artist(value):
+    if isinstance(value, list):
+        for item in value:
+            text = _first_artist(item)
+            if text:
+                return text
+        return ""
+    return _field_text(value)
+
+
+def _thumbnail_url(value):
+    """Return the highest-resolution URL from list, object, or string shapes."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        if value.get("url"):
+            return str(value["url"]).strip()
+        for key in ("thumbnails", "thumbnail", "sources"):
+            result = _thumbnail_url(value.get(key))
+            if result:
+                return result
+        return ""
+    if isinstance(value, list):
+        for item in reversed(value):
+            result = _thumbnail_url(item)
+            if result:
+                return result
+    return ""
+
+
+def normalize_track(item):
+    """Normalize a playable track across YT Music and yt-dlp payload shapes.
+
+    This is deliberately strict: a malformed shelf row is dropped at the
+    boundary instead of leaking "Unknown title" / "Unknown artist" cards into
+    every frontend view. Callers must filter the returned ``None`` values.
+    """
+    if not isinstance(item, dict):
+        return None
+    title = (_field_text(item.get("title")) or _field_text(item.get("name")) or
+             _field_text(item.get("headline")))
+    artists_field = item.get("artists") or item.get("artist") or item.get("author")
+    artist = _first_artist(artists_field)
+    artwork_value = item.get("thumbnails") or item.get("thumbnail") or item.get("artwork")
+    artwork_url = _thumbnail_url(artwork_value)
+    track_id = item.get("videoId") or item.get("id") or item.get("track_id")
+    title = clean(title)
+    artist = clean(artist)
+    track_id = clean(track_id)
+    placeholder_titles = {"unknown", "unknown title", "unknown audio", "untitled", ""}
+    if not title or not track_id or title.lower() in placeholder_titles or not artwork_url:
+        return None
+    duration = item.get("duration") or item.get("duration_seconds") or item.get("length") or item.get("lengthSeconds") or 0
     return {
-        "videoId": clean(track.get("videoId")),
-        "title": clean(track.get("title")) or "Unknown title",
-        "artist": clean(artists),
-        "artistId": artist_list[0]["id"] if artist_list else None,
+        "id": str(track_id),
+        "videoId": str(track_id),
+        "title": title,
+        "artist": artist or "Various Artists",
+        "artwork": artwork_url,
+        "thumbnail": artwork_url,
+        "duration": duration,
+    }
+
+
+def track_data(track):
+    normalized = normalize_track(track)
+    if not normalized:
+        return None
+    artists_field = track.get("artists") or track.get("artist") or track.get("author")
+    artist_list = artists_field if isinstance(artists_field, list) else [artists_field]
+    artist_id = next((clean(a.get("id")) for a in artist_list if isinstance(a, dict) and a.get("id")), None)
+    album = track.get("album")
+    album_name = clean(_field_text(album))
+    album_id = clean(album.get("id")) if isinstance(album, dict) else None
+    art = artwork(track.get("thumbnails") or track.get("thumbnail") or track.get("artwork"))
+    return {
+        **normalized,
+        "artistId": artist_id,
         "album": album_name,
         "albumId": album_id,
-        "duration": clean(track.get("duration")),
-        "thumbnail": artwork(track.get("thumbnails") or track.get("thumbnail"))["thumbnail"],
-        "canvas": artwork(track.get("thumbnails") or track.get("thumbnail"))["canvas"],
+        "canvas": art["canvas"] if art else None,
     }
 
 def session_state():
@@ -1458,7 +1802,8 @@ def auth_setup():
 @app.get("/api/lyrics")
 @rate_limit("lyrics", 12, 10)
 def lyrics():
-    title, artist = clean(request.args.get("title"))[:200], clean(request.args.get("artist"))[:200]
+    title, artist = clean_track_meta(request.args.get("title"), request.args.get("artist"))
+    title, artist = title[:200], artist[:200]
     track_id = clean(request.args.get("track_id"))
     duration = request.args.get("duration") or ""
     if track_id and not valid_video_id(track_id):
@@ -1509,6 +1854,196 @@ def lyrics():
             if lines:
                 return jsonify({"synced": True, "estimated": True, "lines": lines, "text": plain})
         return jsonify({"synced": False, "text": plain, "lines": []})
+
+
+@app.get("/api/karaoke-lyrics")
+@rate_limit("karaoke-lyrics", 8, 10)
+def karaoke_lyrics():
+    """Return syllable-level lyrics without local audio/ML processing.
+
+    NetEase YRC is preferred for true word timing. If it is unavailable, the
+    ordinary timed-line sources are expanded by the small cadence heuristic.
+    The response remains compatible with the regular lyric line schema.
+    """
+    title, artist = clean_track_meta(request.args.get("title"), request.args.get("artist"))
+    duration = request.args.get("duration") or ""
+    try:
+        syllables = fetch_netease_yrc(title, artist)
+        if syllables:
+            return jsonify({"source": "netease_yrc", "precise": True, "lines": syllables})
+
+        raw_lines = []
+        seconds = parse_duration(duration)
+        params = {"track_name": title[:200], "artist_name": artist[:200]}
+        if seconds is not None:
+            params["duration"] = seconds
+        try:
+            query = urllib.parse.urlencode(params)
+            with urllib.request.urlopen(f"https://lrclib.net/api/get?{query}", timeout=6) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            raw_lines = parse_lrc(payload.get("syncedLyrics", ""))
+        except Exception:
+            raw_lines = []
+
+        if not raw_lines:
+            client = get_yt()
+            track_id = clean(request.args.get("track_id"))
+            if client is not None and valid_video_id(track_id):
+                try:
+                    watch = client.get_watch_playlist(videoId=track_id, limit=1)
+                    lyrics_ref = watch.get("lyrics", {})
+                    lyrics_id = lyrics_ref.get("browseId") if isinstance(lyrics_ref, dict) else lyrics_ref
+                    result = client.get_lyrics(lyrics_id) if lyrics_id and hasattr(client, "get_lyrics") else {}
+                    raw_lines = parse_lrc((result or {}).get("lyrics", ""))
+                except Exception:
+                    raw_lines = []
+        lines = build_cadence_lines(raw_lines, seconds)
+        return jsonify({"source": "cadence", "precise": False, "lines": lines})
+    except Exception:
+        return jsonify({"source": "none", "precise": False, "lines": []})
+
+
+def resolve_intro_offset(video_id, audio_duration=None, clean_title="", clean_artist=""):
+    """Resolve a video intro offset through cheap-to-expensive fallbacks.
+
+    The duration gate deliberately runs first. A companion upload that is
+    within three seconds of the audio is the same studio cut for lyric timing;
+    SponsorBlock producer tags and chapters must never shift those lyrics.
+    """
+    info = {}
+    audio_seconds = parse_duration(audio_duration)
+
+    # Resolve metadata before any external offset provider. This is both the
+    # exact-match guard and the source of the later chapter/delta fallbacks.
+    try:
+        import yt_dlp
+        options = {"quiet": True, "no_warnings": True, "noplaylist": True,
+                   "skip_download": True, "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}}
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False) or {}
+    except Exception:
+        info = {}
+
+    try:
+        video_seconds = float(info.get("duration")) if info.get("duration") is not None else None
+        if video_seconds is not None and audio_seconds is not None:
+            delta = abs(video_seconds - audio_seconds)
+            if delta <= 3.0:
+                return {"offset": 0.0, "source": "exact_match"}
+    except (TypeError, ValueError):
+        pass
+
+    # Only non-exact uploads reach the intro waterfall.
+    try:
+        categories = urllib.parse.quote(json.dumps(["music_offtopic"], separators=(",", ":")))
+        request = urllib.request.Request(
+            f"https://sponsor.ajay.app/api/skipSegments?videoID={urllib.parse.quote(video_id)}&categories={categories}",
+            headers={"User-Agent": "myriddim/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=2.5) as response:
+            segments = json.loads(response.read().decode("utf-8"))
+        for segment in segments if isinstance(segments, list) else []:
+            start, end = segment.get("segment", [0, 0]) if isinstance(segment, dict) else (0, 0)
+            if float(start) <= 5.0 and float(end) > float(start):
+                return {"offset": round(float(end), 2), "source": "sponsorblock"}
+    except Exception:
+        pass
+
+    try:
+        chapters = info.get("chapters") or []
+        if len(chapters) > 1:
+            first = chapters[0] or {}
+            title_lower = clean(first.get("title")).lower()
+            if any(marker in title_lower for marker in ("intro", "skit", "scene", "dialogue", "prelude")):
+                end = float(first.get("end_time") or 0)
+                if end > 0:
+                    return {"offset": round(end, 2), "source": "chapter"}
+            second_title = clean(chapters[1].get("title")).lower()
+            if first.get("end_time") and clean_title.lower() in second_title:
+                return {"offset": round(float(first["end_time"]), 2), "source": "chapter"}
+    except Exception:
+        pass
+
+    # Transcript matching is intentionally optional. yt-dlp's JSON3 caption
+    # extraction is not reliable across all clients, so only use a transcript
+    # adapter if a deployment has supplied one.
+    try:
+        transcript_loader = globals().get("get_youtube_transcript")
+        sample_loader = globals().get("get_first_lyric_line")
+        transcript = transcript_loader(video_id) if callable(transcript_loader) else []
+        sample = sample_loader(clean_title, clean_artist) if callable(sample_loader) else ""
+        if transcript and sample:
+            sample = clean(sample).lower()
+            for item in transcript[:15]:
+                if sample in clean(item.get("text")).lower():
+                    return {"offset": round(float(item.get("start") or 0), 2), "source": "transcript"}
+    except Exception:
+        pass
+
+    try:
+        video_seconds = float(info.get("duration")) if info.get("duration") is not None else None
+        if video_seconds is not None and audio_seconds is not None:
+            delta = video_seconds - audio_seconds
+            if delta > 3.0:
+                return {"offset": 0.0, "estimated_delta": round(delta, 2), "source": "delta_estimate"}
+    except (TypeError, ValueError):
+        pass
+    return {"offset": 0.0, "source": "none"}
+
+
+@app.get("/api/video-offset")
+def get_video_offset():
+    video_id = clean(request.args.get("video_id"))
+    if not valid_video_id(video_id):
+        return jsonify({"error": "Invalid video id"}), 400
+    try:
+        with db_connection() as db:
+            row = db.execute("SELECT video_id, intro_offset, source, estimated_delta FROM video_offsets WHERE video_id = ?", (video_id,)).fetchone()
+        if row:
+            return jsonify({"video_id": video_id, "intro_offset": row["intro_offset"], "source": row["source"], "estimated_delta": row["estimated_delta"], "cached": True})
+    except sqlite3.Error:
+        pass
+    meta_title, meta_artist = clean_track_meta(request.args.get("title"), request.args.get("artist"))
+    result = resolve_intro_offset(video_id, request.args.get("audio_duration"), meta_title, meta_artist)
+    try:
+        with db_connection() as db:
+            db.execute("""INSERT INTO video_offsets(video_id, intro_offset, source, estimated_delta)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(video_id) DO UPDATE SET intro_offset=excluded.intro_offset,
+                       source=excluded.source, estimated_delta=excluded.estimated_delta,
+                       updated_at=CURRENT_TIMESTAMP""",
+                       (video_id, result.get("offset", 0.0), result.get("source", "none"), result.get("estimated_delta")))
+    except sqlite3.Error:
+        pass
+    return jsonify({"video_id": video_id, "intro_offset": result.get("offset", 0.0), "source": result.get("source", "none"), "estimated_delta": result.get("estimated_delta"), "cached": False})
+
+
+@app.post("/api/video-offset")
+def save_video_offset():
+    body = request.get_json(silent=True) or {}
+    video_id = clean(body.get("video_id"))
+    if not valid_video_id(video_id):
+        return jsonify({"error": "Invalid video id"}), 400
+    try:
+        offset = float(body.get("intro_offset", 0))
+        if not math.isfinite(offset) or offset < 0 or offset > 30:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "intro_offset must be between 0 and 30 seconds"}), 400
+    source = clean(body.get("source")) or "manual"
+    if source != "manual":
+        source = "manual"
+    try:
+        with db_connection() as db:
+            db.execute("""INSERT INTO video_offsets(video_id, intro_offset, source, estimated_delta)
+                       VALUES (?, ?, ?, NULL)
+                       ON CONFLICT(video_id) DO UPDATE SET intro_offset=excluded.intro_offset,
+                       source=excluded.source, estimated_delta=NULL, updated_at=CURRENT_TIMESTAMP""",
+                       (video_id, round(offset, 2), source))
+    except sqlite3.Error as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"video_id": video_id, "intro_offset": round(offset, 2), "source": source, "cached": True})
+
 
 @app.post("/api/track/rate")
 @rate_limit("rate", 20, 10)
@@ -1626,20 +2161,37 @@ def score_rows(rows):
     a recency boost. Returns tracks sorted by score descending."""
     scored = []
     for row in rows:
+        normalized = normalize_track({
+            "videoId": row["video_id"], "title": row["title"], "artist": row["artist"],
+            "album": row["album"], "thumbnail": row["thumbnail_url"],
+        })
+        if not normalized:
+            continue
         plays, skips = row["plays"] or 0, row["skips"] or 0
         recent = row["recent_plays"] or 0
         completions = row["completions"] or 0
         # Completion is a strong positive signal; skips are a strong negative.
         score = plays * 2 - skips * 5 + completions * 3 + recent
-        scored.append({"canonicalId": row["canonical_id"], "videoId": row["video_id"], "title": row["title"], "artist": row["artist"],
-                       "album": row["album"], "thumbnail": row["thumbnail_url"], "plays": plays,
+        scored.append({"canonicalId": row["canonical_id"], "videoId": normalized["videoId"], "title": normalized["title"], "artist": normalized["artist"],
+                       "album": row["album"], "thumbnail": normalized["thumbnail"], "plays": plays,
                        "skips": skips, "score": score, "last_played": row["last_played"]})
     return sorted(scored, key=lambda item: item["score"], reverse=True)
 
 
 def stat_track(row):
-    return {"videoId": row["video_id"], "title": row["title"], "artist": row["artist"],
-            "album": row["album"], "thumbnail": row["thumbnail_url"]}
+    """Normalize a SQLite listen row before exposing it as a playable card."""
+    normalized = normalize_track({
+        "videoId": row["video_id"],
+        "title": row["title"],
+        "artist": row["artist"],
+        "album": row["album"],
+        "thumbnail": row["thumbnail_url"] if "thumbnail_url" in row.keys() else row["thumbnail"],
+    })
+    if not normalized:
+        return None
+    return {"videoId": normalized["videoId"], "id": normalized["videoId"],
+            "title": normalized["title"], "artist": normalized["artist"],
+            "album": clean(row["album"]), "thumbnail": normalized["thumbnail"]}
 
 @app.get("/api/stats/monthly-top")
 def monthly_top():
@@ -1652,8 +2204,8 @@ def monthly_top():
             MAX(thumbnail_url) thumbnail_url, COUNT(*) plays, SUM(listen_duration_seconds) seconds
             FROM listens GROUP BY video_id ORDER BY plays DESC, seconds DESC LIMIT 25""").fetchall()
         total = db.execute("SELECT COALESCE(SUM(listen_duration_seconds), 0) FROM listens WHERE played_at_timestamp LIKE ?", (month + "%",)).fetchone()[0]
-    return jsonify({"month": month, "totalMinutes": round(total / 60), "monthly": [dict(stat_track(row), plays=row["plays"]) for row in rows],
-                    "heavyRotation": [dict(stat_track(row), plays=row["plays"]) for row in all_time]})
+    return jsonify({"month": month, "totalMinutes": round(total / 60), "monthly": [dict(track, plays=row["plays"]) for row in rows if (track := stat_track(row))],
+                    "heavyRotation": [dict(track, plays=row["plays"]) for row in all_time if (track := stat_track(row))]})
 
 @app.get("/api/stats/analytics")
 def stats_analytics():
@@ -1709,10 +2261,8 @@ def stats_analytics():
                 "uniqueArtists": metrics["unique_artists"] or 0,
             },
             "topArtists": [dict(row) for row in artist_rows],
-            "topTracks": [{"videoId": row["video_id"], "title": row["title"],
-                           "artist": row["artist"], "album": row["album"],
-                           "thumbnail": row["thumbnail"], "plays": row["plays"],
-                           "seconds": row["seconds"]} for row in track_rows],
+            "topTracks": [dict(track, plays=row["plays"], seconds=row["seconds"])
+                          for row in track_rows if (track := stat_track(row))],
             "trend": [dict(row) for row in trend_rows],
             "heatmap": [dict(row) for row in heatmap_rows],
         })
@@ -1773,7 +2323,7 @@ def smart_mix():
                     if not valid_video_id(video_id):
                         continue
                     track = track_data(item)
-                    if not track.get("videoId"):
+                    if not track or not track.get("videoId"):
                         continue
                     canonical = ingest_track(
                         db, source="youtube", source_id=video_id,
@@ -1891,7 +2441,7 @@ def smart_playlist():
         sql, params = build_smart_playlist_query(rules, body.get("limit", 50))
         with db_connection() as db:
             rows = db.execute(sql, params).fetchall()
-        return jsonify({"tracks": [dict(stat_track(row), plays=row["plays"]) for row in rows], "rules": rules})
+        return jsonify({"tracks": [dict(track, plays=row["plays"]) for row in rows if (track := stat_track(row))], "rules": rules})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1938,7 +2488,7 @@ def evaluate_smart_playlist(playlist_id):
         sql, params = build_smart_playlist_query(rules, row["track_limit"])
         with db_connection() as db:
             tracks = db.execute(sql, params).fetchall()
-        return jsonify({"id": playlist_id, "tracks": [dict(stat_track(track), plays=track["plays"]) for track in tracks], "rules": rules})
+        return jsonify({"id": playlist_id, "tracks": [dict(track, plays=track_row["plays"]) for track_row in tracks if (track := stat_track(track_row))], "rules": rules})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
@@ -1969,8 +2519,9 @@ def quick_picks():
         for shelf in shelves:
             title = clean(shelf.get("title"))
             for item in shelf.get("contents", []):
-                if item.get("videoId") and ("quick" in title.lower() or not tracks):
-                    tracks.append(track_data(item))
+                track = track_data(item)
+                if track and ("quick" in title.lower() or not tracks):
+                    tracks.append(track)
                 if len(tracks) >= 12:
                     break
             if len(tracks) >= 12:
@@ -2004,7 +2555,7 @@ def recommendations():
             if not valid_video_id(candidate_id) or candidate_id in seen:
                 continue
             track = track_data(item)
-            if not track.get("videoId"):
+            if not track:
                 continue
             seen.add(candidate_id)
             tracks.append(track)
@@ -2099,14 +2650,16 @@ def discovery_shelf():
                     watch = client.get_watch_playlist(videoId=seed_id, radio=True, limit=25) or {}
                     for item in watch.get("tracks", []) or []:
                         track = track_data(item)
-                        if track.get("videoId") and track["videoId"] not in seen:
-                            track["discovery_source"] = "discovery_radio"
-                            seen.add(track["videoId"])
-                            discovery.append(track)
+                        if not track or track["videoId"] in seen:
+                            continue
+                        track["discovery_source"] = "discovery_radio"
+                        seen.add(track["videoId"])
+                        discovery.append(track)
                 except Exception as exc:
                     print(f"Discovery radio failed for {seed_id}: {exc}", flush=True)
+
             # 2. One-hop related-artist traversal: same sonic space as the
-            # user's top artists, but artists with ~no local play history.
+            # user's top artists, but artists with little local play history.
             for artist_name in _discovery_top_artists(db, 3)[:3]:
                 if len(discovery) >= 12:
                     break
@@ -2123,17 +2676,19 @@ def discovery_shelf():
                         songs = client.search(f"{related_name} top tracks", filter="songs", limit=4) or []
                         for item in songs:
                             track = track_data(item)
-                            if track.get("videoId") and track["videoId"] not in seen:
-                                track["discovery_source"] = "related_artist"
-                                track["related_to"] = artist_name
-                                seen.add(track["videoId"])
-                                discovery.append(track)
+                            if not track or track["videoId"] in seen:
+                                continue
+                            track["discovery_source"] = "related_artist"
+                            track["related_to"] = artist_name
+                            seen.add(track["videoId"])
+                            discovery.append(track)
                             if len(discovery) >= 12:
                                 break
                         if len(discovery) >= 12:
                             break
                 except Exception as exc:
                     print(f"Related-artist traversal failed for {artist_name}: {exc}", flush=True)
+
             # 3. Familiar ground: unplayed tracks from the user's top artists.
             for artist_name in _discovery_top_artists(db, 5)[:5]:
                 if len(familiar) >= 8:
@@ -2142,10 +2697,11 @@ def discovery_shelf():
                     songs = client.search(artist_name, filter="songs", limit=6) or []
                     for item in songs:
                         track = track_data(item)
-                        if track.get("videoId") and track["videoId"] not in seen:
-                            track["discovery_source"] = "familiar_deep_cut"
-                            seen.add(track["videoId"])
-                            familiar.append(track)
+                        if not track or track["videoId"] in seen:
+                            continue
+                        track["discovery_source"] = "familiar_deep_cut"
+                        seen.add(track["videoId"])
+                        familiar.append(track)
                         if len(familiar) >= 8:
                             break
                 except Exception as exc:
@@ -2231,7 +2787,7 @@ def discover():
             tracks = []
             for item in (shelf.get("contents") or []):
                 track = track_data(item)
-                if track.get("videoId"):
+                if track and track.get("videoId"):
                     tracks.append(track)
             if tracks:
                 shelves.append({"title": title, "tracks": tracks})
@@ -2307,7 +2863,7 @@ def _artist_payload(client, browse_id):
         "subscribers": clean(data.get("subscribers")),
         "views": clean(data.get("views")),
         "thumbnail": thumbnail(data.get("thumbnails")),
-        "songs": [track_data(item) for item in section(data.get("songs")) if item.get("videoId")],
+        "songs": [track for item in section(data.get("songs")) if (track := track_data(item))],
         "albums": [artist_release(item) for item in section(data.get("albums")) if item.get("browseId")],
         "singles": [artist_release(item) for item in section(data.get("singles")) if item.get("browseId")],
     }
@@ -2320,7 +2876,7 @@ def _album_payload(client, browse_id):
         artists = [artists]
     artist_name = ", ".join(clean(a.get("name")) for a in artists if isinstance(a, dict) and a.get("name"))
     artist_id = next((clean(a.get("id")) for a in artists if isinstance(a, dict) and a.get("id")), None)
-    tracks = [track_data(item) for item in (data.get("tracks") or []) if item.get("videoId")]
+    tracks = [track for item in (data.get("tracks") or []) if (track := track_data(item))]
     return {
         "browseId": browse_id,
         "title": clean(data.get("title")),
@@ -2432,9 +2988,7 @@ def stats_rotation():
                FROM listens WHERE completed = 1 AND played_at_timestamp >= ? AND video_id != ''
                GROUP BY video_id ORDER BY plays DESC, MAX(played_at_timestamp) DESC LIMIT 15""",
             (cutoff,)).fetchall()
-        tracks = [{"videoId": row["video_id"], "title": row["title"], "artist": row["artist"],
-                   "album": row["album"], "thumbnail": row["thumbnail_url"], "plays": row["plays"]}
-                  for row in rows]
+        tracks = [track for row in rows if (track := stat_track(row))]
         return jsonify({"tracks": tracks})
 
 
@@ -2466,30 +3020,38 @@ def ytm_feed():
                 continue
             items = []
             for item in contents:
-                thumbs = item.get("thumbnails") or [{}]
-                thumb = ""
-                if thumbs:
-                    last = thumbs[-1]
-                    thumb = last.get("url") if isinstance(last, dict) else str(last)
-                video_id = item.get("videoId")
-                playlist_id = item.get("playlistId")
-                browse_id = item.get("browseId")
-                artists = item.get("artists") or []
-                author = item.get("author") or []
-                subtitle = ""
-                if artists and isinstance(artists[0], dict):
-                    subtitle = artists[0].get("name") or ""
-                elif author and isinstance(author[0], dict):
-                    subtitle = author[0].get("name") or ""
-                if not subtitle:
-                    subtitle = item.get("description") or ""
+                if not isinstance(item, dict):
+                    continue
+                video_id = clean(item.get("videoId"))
+                playlist_id = clean(item.get("playlistId"))
+                browse_id = clean(item.get("browseId"))
                 item_type = "song" if video_id else ("playlist" if (playlist_id or browse_id) else "item")
+
+                if item_type == "song":
+                    track = track_data(item)
+                    if not track:
+                        continue
+                    items.append({
+                        "id": track["videoId"],
+                        "type": "song",
+                        "title": track["title"],
+                        "subtitle": track["artist"],
+                        "thumbnail": track["thumbnail"],
+                        "track_count": item.get("itemCount"),
+                        "views": item.get("views"),
+                    })
+                    continue
+
+                title = clean(_field_text(item.get("title")) or _field_text(item.get("name")))
+                item_id = playlist_id or browse_id
+                if not title or not item_id:
+                    continue
                 items.append({
-                    "id": video_id or playlist_id or browse_id,
+                    "id": item_id,
                     "type": item_type,
-                    "title": item.get("title") or "",
-                    "subtitle": subtitle,
-                    "thumbnail": thumb,
+                    "title": title,
+                    "subtitle": clean(_first_artist(item.get("artists") or item.get("author"))) or clean(_field_text(item.get("description"))),
+                    "thumbnail": _thumbnail_url(item.get("thumbnails") or item.get("thumbnail")),
                     "track_count": item.get("itemCount"),
                     "views": item.get("views"),
                 })
@@ -2576,8 +3138,9 @@ def liked():
         return api_error(RuntimeError("ytmusicapi is not available"))
     try:
         songs = client.get_liked_songs(limit=None).get("tracks", [])
-        payload = {"id": "LM", "title": "Liked Music", "count": len(songs), "thumbnail": thumbnail(songs[0].get("thumbnails")) if songs else None,
-                   "tracks": [track_data(track) for track in songs]}
+        liked_tracks = [track for item in songs if (track := track_data(item))]
+        payload = {"id": "LM", "title": "Liked Music", "count": len(liked_tracks), "thumbnail": thumbnail(songs[0].get("thumbnails")) if songs else None,
+                   "tracks": liked_tracks}
         # Same silent-empty trap as /api/playlists: a lapsed session can return
         # zero songs without raising. Don't let that overwrite a healthy cache.
         if not songs and session_state() == "expired":
@@ -2611,7 +3174,7 @@ def playlist(pid):
             from ytmusicapi import YTMusic
             client = YTMusic()
             data = client.get_playlist(pid, limit=None)
-        tracks = [track_data(track) for track in data.get("tracks", []) if track.get("videoId")]
+        tracks = [track for item in data.get("tracks", []) if (track := track_data(item))]
         # Record the view so /api/playlists/recent can surface it.
         try:
             with db_connection() as db:
@@ -2656,8 +3219,48 @@ def _normalized_search_tokens(value):
             if token not in {"the", "a", "an", "feat", "ft", "official", "video", "music"}]
 
 
-def _companion_candidate_score(item, title, artist):
+def _video_duration_seconds(item):
+    for key in ("duration_seconds", "lengthSeconds", "duration", "length"):
+        value = item.get(key) if isinstance(item, dict) else None
+        parsed = parse_duration(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _video_cache_get(audio_video_id):
+    try:
+        with db_connection() as db:
+            row = db.execute("SELECT * FROM video_resolutions WHERE audio_video_id = ?", (audio_video_id,)).fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error:
+        return None
+
+
+def _video_cache_save(audio_video_id, music_video_id, title, artist, source):
+    try:
+        with db_connection() as db:
+            db.execute("""INSERT INTO video_resolutions(audio_video_id, music_video_id, title, artist, source)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(audio_video_id) DO UPDATE SET music_video_id=excluded.music_video_id,
+                       title=excluded.title, artist=excluded.artist, source=excluded.source,
+                       resolved_at=CURRENT_TIMESTAMP""",
+                       (audio_video_id, music_video_id, title, artist, source))
+    except sqlite3.Error:
+        pass
+
+
+def _companion_candidate_score(item, title, artist, audio_duration=None):
     """Score a raw YT Music video result while rejecting non-video releases."""
+    video_type = clean(item.get("videoType") or item.get("type") or item.get("category") or item.get("resultType")).upper().replace("-", "_")
+    if video_type not in {
+        "VIDEO", "MUSIC_VIDEO", "OFFICIAL_MUSIC_VIDEO", "MUSIC_VIDEO_TYPE_ATV",
+        "MUSIC_VIDEO_TYPE_OMV",
+    }:
+        return None
+    candidate_duration = _video_duration_seconds(item)
+    if audio_duration is not None and candidate_duration is not None and abs(candidate_duration - audio_duration) > 15:
+        return None
     candidate_title = clean(item.get("title"))
     raw_artists = item.get("artists") or item.get("artist") or []
     if isinstance(raw_artists, list):
@@ -2694,6 +3297,24 @@ def companion_video(video_id):
     video_id = clean(video_id)
     title = clean(request.args.get("title"))[:200]
     artist = clean(request.args.get("artist"))[:200]
+    explicit_id = clean(request.args.get("music_video_id") or request.args.get("musicVideoId"))
+    audio_duration = parse_duration(request.args.get("audio_duration"))
+    cache_key = (video_id, title.lower(), artist.lower(), explicit_id)
+    now = time.time()
+    if not valid_video_id(video_id):
+        return jsonify({"has_video": False, "video_id": None})
+    # An explicit companion id has already been selected by the catalog; the
+    # only verification needed here is the YouTube ID shape. Never search again.
+    if valid_video_id(explicit_id):
+        payload = {"has_video": True, "video_id": explicit_id, "source": "explicit"}
+        _video_cache_save(video_id, explicit_id, title, artist, "explicit")
+        return jsonify(payload)
+    cached_db = _video_cache_get(video_id)
+    if cached_db is not None:
+        payload = {"has_video": bool(valid_video_id(cached_db.get("music_video_id"))),
+                   "video_id": cached_db.get("music_video_id") if valid_video_id(cached_db.get("music_video_id")) else None,
+                   "source": cached_db.get("source", "cache")}
+        return jsonify({**payload, "cached": True})
     cache_key = (video_id, title.lower(), artist.lower())
     now = time.time()
     with companion_video_cache_lock:
@@ -2712,7 +3333,7 @@ def companion_video(video_id):
         if client is None:
             from ytmusicapi import YTMusic
             client = YTMusic()
-        query = f"{artist} - {title} official video"
+        query = f"{artist} {title} official music video"
         try:
             results = client.search(query, filter="videos", limit=3)
         except TypeError:
@@ -2726,6 +3347,7 @@ def companion_video(video_id):
                 results = public_client.search(query, filter="videos", limit=3)
             except TypeError:
                 results = public_client.search(query, filter="videos")[:3]
+        audio_duration = parse_duration(request.args.get("audio_duration"))
         ranked = []
         for item in results or []:
             if not isinstance(item, dict):
@@ -2733,18 +3355,7 @@ def companion_video(video_id):
             candidate_id = clean(item.get("videoId"))
             if not valid_video_id(candidate_id) or candidate_id == video_id:
                 continue
-            # Search results can contain ordinary videos, fan uploads, and
-            # audio tracks even with filter="videos". Require YT Music's
-            # explicit music-video classification; this is what keeps an
-            # album-only cut such as Nines - Flavours from getting a false
-            # Watch Video affordance.
-            video_type = clean(item.get("videoType") or item.get("type")).upper().replace("-", "_")
-            if video_type not in {
-                "MUSIC_VIDEO", "OFFICIAL_MUSIC_VIDEO", "MUSIC_VIDEO_TYPE_ATV",
-                "MUSIC_VIDEO_TYPE_OMV",
-            }:
-                continue
-            score = _companion_candidate_score(item, title, artist)
+            score = _companion_candidate_score(item, title, artist, audio_duration)
             if score is not None:
                 ranked.append((score, item))
         ranked.sort(key=lambda entry: entry[0], reverse=True)
@@ -2759,6 +3370,7 @@ def companion_video(video_id):
         payload = {"has_video": False, "video_id": None}
     with companion_video_cache_lock:
         companion_video_cache[cache_key] = {"payload": payload, "timestamp": time.time()}
+    _video_cache_save(video_id, payload.get("video_id"), title, artist, "search" if payload["has_video"] else "negative")
     return jsonify(payload)
 
 
