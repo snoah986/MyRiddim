@@ -24,7 +24,7 @@
   import { apiFetch } from './lib/api.js'
   import { createMixController } from './lib/mix.js'
   import { normalizePlayable, normalizeTrack, trackKey } from './lib/tracks.js'
-  import { queue, hydrateQueue, persistQueue, seed, selectNext, selectPrevious, playUpcoming, playNext, addToQueue, appendTracks, removeUpcoming, clearUpcoming, clearManualUpcoming, reorderUpcoming, toggleShuffle, cycleRepeat } from './lib/queue.js'
+  import { queue, hydrateQueue, persistQueue, seed, selectNext, selectPrevious, playUpcoming, playNext, addToQueue, appendTracks, removeUpcoming, clearUpcoming, clearManualUpcoming, reorderUpcoming, reconcilePartyQueue, toggleShuffle, cycleRepeat } from './lib/queue.js'
 
   const playPulse = spring(1, { stiffness: 320, damping: 14 })
   let pipWindow = null, pipLyricsOpen = false, pipLyricsFor = null, pipLiked = false, accent = '#f2ece4'
@@ -191,8 +191,8 @@
         partyAppliedIds.add(command.payload.videoId)
         const track = normalizePlayable(command.payload)
         if (track) {
-          if (command.payload.priority) playNext(track)
-          else addToQueue(track)
+          if (command.payload.priority) playNext(track, 'party')
+          else addToQueue(track, 'party')
         }
       }
     }
@@ -212,17 +212,17 @@
         await apiFetch('/api/party/played', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code: partyRoom.code, video_id: activePartyTrack }) }).catch(() => {})
         next()
       }
-      // Reconcile queued guest requests into the local queue. The approve
-      // path also lands here, guarded by partyAppliedIds.
-      for (const entry of data.queue || []) {
-        if (!entry.videoId || partyAppliedIds.has(entry.videoId)) continue
-        partyAppliedIds.add(entry.videoId)
-        const track = normalizePlayable({ videoId: entry.videoId, title: entry.title, artist: entry.artist, thumbnail: entry.thumbnail, duration: entry.duration, requested_by: entry.requested_by, priority: entry.priority })
-        if (track) {
-          if (entry.priority) playNext(track)
-          else addToQueue(track)
-        }
-      }
+      // Keep the local party-owned slice in the server's vote/priority order
+      // without disturbing listener-added or radio-backed tracks.
+      reconcilePartyQueue((data.queue || []).map(entry => ({
+        videoId: entry.videoId,
+        title: entry.title,
+        artist: entry.artist,
+        thumbnail: entry.thumbnail,
+        duration: entry.duration,
+        requested_by: entry.requested_by,
+        priority: entry.priority,
+      })))
       const pending = data.pending || []
       if (pending.length > previousPending) {
         const latest = pending[pending.length - 1]
