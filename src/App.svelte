@@ -39,7 +39,8 @@
   let pickerQuery = '', pickerMembership = {}, pickerChecking = false, pickerDragY = 0, pickerDragStart = null, pickerListEl = null
   let oauthTab = 'paste', oauthClientId = '', oauthClientSecret = '', oauthDevice = null, oauthCode = '', oauthError = '', oauthBusy = false, setupTab = 'oauth'
   let currentTrack = null, currentIndex = -1, theatreOpen = false, toast = '', toastTimer, activeQueue = { history: [], nowPlaying: null, upNext: [], repeat: 'off', shuffle: false }, isPlaying = false, currentTime = 0, duration = 0, volume = 1, loadingTrack = false, listenRecorded = false, queueOpen = false, draggedIndex = -1, queueTab = 'queue', playbackRequest = 0, playbackAbort = null
-  let remotePollTimer = null, remotePublishTimer = null, remoteCommandsBusy = false, remoteExecutedCommandIds = new Set()
+  let remotePollTimer = null, remotePublishTimer = null, remoteCommandsBusy = false, remoteExecutedCommandIds = new Set(), lastRemotePublish = 0
+  const REMOTE_SYNC_INTERVAL = 2750
   let partyRoom = null, partyPopoverOpen = false, partySetupOpen = false, partyPollTimer = null, partyInviteBase = '', partyPlayedId = null, partySkipHandledId = null
   let partyQueueSnapshot = null
   const partyAppliedIds = new Set()
@@ -71,10 +72,12 @@
   }
   function publishRemoteState() {
     if (remotePublishTimer) return
+    const delay = Math.max(0, REMOTE_SYNC_INTERVAL - (Date.now() - lastRemotePublish))
     remotePublishTimer = setTimeout(async () => {
       remotePublishTimer = null
+      lastRemotePublish = Date.now()
       try { await apiFetch('/api/remote/state', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(remotePayload()) }) } catch { /* remote control is optional */ }
-    }, 250)
+    }, delay)
   }
   async function executeRemoteCommands(commands) {
     if (remoteCommandsBusy || !Array.isArray(commands) || !commands.length) return
@@ -89,7 +92,7 @@
         if (command.action === 'toggle_play') togglePlay()
         else if (command.action === 'previous') previous()
         else if (command.action === 'next') next()
-        else if (command.action === 'seek') { audio.currentTime = Number(payload); currentTime = Number(payload) }
+        else if (command.action === 'seek') seekTo(payload)
         else if (command.action === 'set_volume') { volume = Number(payload); audio.volume = volume; savePlayerState() }
         else if (command.action === 'toggle_shuffle') toggleShuffle()
         else if (command.action === 'toggle_repeat') cycleRepeat()
@@ -113,7 +116,7 @@
   function startRemoteSync() {
     publishRemoteState()
     pollRemoteState()
-    remotePollTimer = setInterval(pollRemoteState, 750)
+    remotePollTimer = setInterval(pollRemoteState, REMOTE_SYNC_INTERVAL)
   }
 
   async function health() { const response = await apiFetch('/api/health'); if (!response.ok) throw Error('Could not reach the backend.'); return response.json() }
@@ -131,19 +134,31 @@
     if (!partyRoom) partySetupOpen = !partySetupOpen
     else partyPopoverOpen = !partyPopoverOpen
   }
-  async function createParty(settings = {}) {
+  async function createParty(customSettings = {}) {
     try {
-      const response = await apiFetch('/api/party/create', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ host_name: settings.host_name || 'Host', settings }) })
+      const response = await apiFetch('/api/party/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          host_name: customSettings.host_name || 'Host',
+          settings: customSettings,
+        }),
+      })
       const data = await response.json()
-      if (!response.ok || data.error) throw Error(data.error || 'Could not create the party room')
+      if (response.status !== 201 || data.error) throw Error('Failed to start party: check backend server')
       partyAppliedIds.clear(); partyPlayedId = null; partySkipHandledId = null
       partyQueueSnapshot = [...activeQueue.upNext]
       partyRoom = decorateParty(data)
       partySetupOpen = false
       partyPopoverOpen = true
-      clearInterval(partyPollTimer); partyPollTimer = setInterval(pollParty, 2000)
-      showToast(`Party room ${data.code} is live`)
-    } catch (error) { showToast(error.message || 'Could not create the party room') }
+      clearInterval(partyPollTimer)
+      partyPollTimer = setInterval(pollParty, 2000)
+      showToast(`Party room ${data.code || data.room_code} is live`)
+      return data
+    } catch (error) {
+      showToast('Failed to start party: check backend server')
+      return null
+    }
   }
   function endPartyLocal() {
     clearInterval(partyPollTimer)
@@ -244,7 +259,7 @@
   function onPartyRole(guestId, role) { partyAction('role', { guest_id: guestId, role }) }
   function onPartyKick(guestId) { partyAction('kick', { guest_id: guestId }) }
   function onPartySetting(key, value) { partyAction('settings', { settings: { [key]: value } }) }
-  function launchParty(settings) { createParty(settings) }
+  function launchParty(settings) { return createParty(settings) }
   function onPartyCopyInvite() { if (partyRoom?.inviteUrl && navigator.clipboard) navigator.clipboard.writeText(partyRoom.inviteUrl).then(() => showToast('Invite link copied')).catch(() => {}) }
   async function waitForBackend(attempts = 20) {
     let lastError
@@ -424,7 +439,7 @@
   }
   async function loadHomeExtras() {
     const [rotationResponse, recentResponse] = await Promise.all([apiFetch('/api/home/stats-rotation'), apiFetch('/api/playlists/recent')])
-    if (rotationResponse.ok) rotationTracks = (await rotationResponse.json()).tracks || []
+    if (rotationResponse.ok) rotationTracks = ((await rotationResponse.json()).tracks || []).map(normalizeTrack).filter(Boolean)
     if (recentResponse.ok) recentPlaylists = (await recentResponse.json()).playlists || []
   }
   let moods = [], activeMood = null, moodPlaylists = [], moodLoading = false
@@ -714,8 +729,8 @@
       pipWindow.document.getElementById('pip-prev').addEventListener('click', previous)
       pipWindow.document.getElementById('pip-next').addEventListener('click', next)
       pipWindow.document.getElementById('pip-close').addEventListener('click', () => togglePip())
-      pipWindow.document.getElementById('pip-seek-range').addEventListener('input', seek)
-      pipWindow.document.getElementById('pip-volume-range').addEventListener('input', setPipVolume)
+      pipWindow.document.getElementById('pip-seek-range').addEventListener('change', seek)
+      pipWindow.document.getElementById('pip-volume-range').addEventListener('change', setPipVolume)
       pipWindow.document.getElementById('pip-lyrics').addEventListener('click', togglePipLyrics)
       pipWindow.document.getElementById('pip-like').addEventListener('click', togglePipLike)
       pipWindow.addEventListener('pagehide', () => { pipWindow = null; pipLyricsOpen = false })
@@ -723,9 +738,7 @@
     } catch { showToast('Could not open mini player') }
   }
   function setPipVolume(event) {
-    volume = Number(event.currentTarget.value)
-    audio.volume = volume
-    savePlayerState()
+    setVolume(event)
     syncPip()
   }
   function togglePipLyrics() {
@@ -764,7 +777,7 @@
       updatePipLyricsActive()
     } catch { if (status) status.textContent = 'Lyrics unavailable' }
   }
-  function seekLine(time) { if (Number.isFinite(time)) audio.currentTime = time }
+  function seekLine(time) { if (Number.isFinite(time)) seekTo(time) }
   function updatePipLyricsActive() {
     if (!pipWindow?.document) return
     const lines = [...pipWindow.document.querySelectorAll('.pip-lyric')]
@@ -858,6 +871,7 @@
     const streamTrackId = track.canonicalId || track.videoId
     const gaplessHandoff = audio.gapFilled && track.videoId === activeQueue.nowPlaying?.videoId
     currentTrack = track; currentIndex = index; listenRecorded = false; preloadedTrackId = null; loadingTrack = true; isPlaying = true
+    publishRemoteState()
     notifyPartyTrackStarted(track)
     // Unified audio-state lock: abort any in-flight stream fetch and clear both
     // media buffers before the new request can resolve. A gapless handoff is
@@ -1035,7 +1049,7 @@
     if (event.shiftKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight') && currentTrack && !['INPUT', 'TEXTAREA'].includes(event.target.tagName)) {
       event.preventDefault()
       const delta = event.key === 'ArrowLeft' ? -5 : 5
-      audio.currentTime = Math.max(0, Math.min(duration || 0, audio.currentTime + delta))
+      seekTo(Math.max(0, Math.min(duration || 0, audio.currentTime + delta)))
       return
     }
     if (gridNav(event)) return
@@ -1084,9 +1098,10 @@
       isPlaying = true
       audio.play().catch(error => { isPlaying = false; authError = error.message })
     }
+    publishRemoteState()
   }
-  function next() { if (activeQueue.repeat === 'one' && currentTrack) { audio.currentTime = 0; audio.play(); return } if (duration > 0 && currentTime > 0) reportEvent(duration - currentTime <= duration * 0.2 ? 'completed' : (currentTime < 30 ? 'skipped' : null)); if (activeQueue.upNext.length) { selectNext(); return } if (activeQueue.repeat === 'all' && activeQueue.history.length) { seed([...activeQueue.history, activeQueue.nowPlaying], 0); return } if ($settings.autoRadio !== false && currentTrack) radioTopup(currentTrack, true).then(() => { if (activeQueue.upNext.length) selectNext() }) }
-  function previous() { if (audio?.currentTime > 3) audio.currentTime = 0; else selectPrevious() }
+  function next() { if (activeQueue.repeat === 'one' && currentTrack) { seekTo(0); audio.play(); return } if (duration > 0 && currentTime > 0) reportEvent(duration - currentTime <= duration * 0.2 ? 'completed' : (currentTime < 30 ? 'skipped' : null)); if (activeQueue.upNext.length) { selectNext(); return } if (activeQueue.repeat === 'all' && activeQueue.history.length) { seed([...activeQueue.history, activeQueue.nowPlaying], 0); return } if ($settings.autoRadio !== false && currentTrack) radioTopup(currentTrack, true).then(() => { if (activeQueue.upNext.length) selectNext() }) }
+  function previous() { if (audio?.currentTime > 3) seekTo(0); else selectPrevious() }
   function jumpTo(track) { playUpcoming(track); queueOpen = false }
   function dragStart(index) { draggedIndex = index }
   function dropAt(index) { reorderUpcoming(draggedIndex, index); draggedIndex = -1 }
@@ -1110,8 +1125,20 @@
     const payload = { video_id: currentTrack.videoId, title: currentTrack.title, artist: currentTrack.artist, album: currentTrack.album, thumbnail_url: currentTrack.thumbnail, event, listen_duration_seconds: Math.round(currentTime) }
     apiFetch('/api/stats/event', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }).catch(() => {})
   }
-  function seek(event) { if (audio) audio.currentTime = Number(event.currentTarget.value) }
-  function setVolume(event) { volume = Number(event.currentTarget.value); if (audio) audio.volume = volume; savePlayerState() }
+  function seekTo(value) {
+    const nextTime = Number(value)
+    if (!Number.isFinite(nextTime)) return
+    if (audio) audio.currentTime = nextTime
+    currentTime = nextTime
+    publishRemoteState()
+  }
+  function seek(event) { seekTo(event.currentTarget.value) }
+  function setVolume(event) {
+    volume = Number(event.currentTarget.value)
+    if (audio) audio.volume = volume
+    savePlayerState()
+    publishRemoteState()
+  }
   // Media Session API: physical media keys (Play/Pause/Next/Previous) control the
   // app in the browser and inside the Tauri webview (WebView2 supports it).
   function wireMediaSession() {
@@ -1131,7 +1158,7 @@
     navigator.mediaSession.setActionHandler('pause', () => { if (isPlaying) togglePlay() })
     navigator.mediaSession.setActionHandler('nexttrack', next)
     navigator.mediaSession.setActionHandler('previoustrack', previous)
-    navigator.mediaSession.setActionHandler('seekto', (details) => { if (details.seekTime != null) audio.currentTime = details.seekTime })
+    navigator.mediaSession.setActionHandler('seekto', (details) => { if (details.seekTime != null) seekTo(details.seekTime) })
     window.__updateMediaSession = updateMetadata
     updateMetadata()
   }
@@ -1150,11 +1177,11 @@
     }
     window.addEventListener('pagehide', savePlayerState)
     wireMediaSession()
-    audio.addEventListener('play', () => { isPlaying = true; publishRemoteState(); syncPip(); window.__updateMediaSession?.() })
-    audio.addEventListener('pause', () => { if (!loadingTrack) isPlaying = false; publishRemoteState(); savePlayerState(); syncPip(); window.__updateMediaSession?.() })
-    audio.addEventListener('timeupdate', () => { currentTime = audio.currentTime; publishRemoteState(); if (currentTime >= 30) recordListen(); const now = Date.now(); if (now - lastPersist > 5000) { lastPersist = now; savePlayerState() } const upcoming = activeQueue.upNext?.[0]; if (upcoming?.videoId && preloadedTrackId !== upcoming.videoId && duration > 0 && duration - currentTime <= 20) { preloadedTrackId = upcoming.videoId; preloadNext() } syncPip(); window.__updateMediaSession?.() })
-    audio.addEventListener('loadedmetadata', () => { duration = audio.duration; publishRemoteState(); syncPip(); window.__updateMediaSession?.() })
-    audio.addEventListener('ended', () => { reportEvent('completed'); savePlayerState(); next(); publishRemoteState() })
+    audio.addEventListener('play', () => { isPlaying = true; syncPip(); window.__updateMediaSession?.() })
+    audio.addEventListener('pause', () => { if (!loadingTrack) isPlaying = false; savePlayerState(); syncPip(); window.__updateMediaSession?.() })
+    audio.addEventListener('timeupdate', () => { currentTime = audio.currentTime; if (currentTime >= 30) recordListen(); const now = Date.now(); if (now - lastPersist > 5000) { lastPersist = now; savePlayerState() } const upcoming = activeQueue.upNext?.[0]; if (upcoming?.videoId && preloadedTrackId !== upcoming.videoId && duration > 0 && duration - currentTime <= 20) { preloadedTrackId = upcoming.videoId; preloadNext() } syncPip(); window.__updateMediaSession?.() })
+    audio.addEventListener('loadedmetadata', () => { duration = audio.duration; syncPip(); window.__updateMediaSession?.() })
+    audio.addEventListener('ended', () => { reportEvent('completed'); savePlayerState(); next() })
     audio.addEventListener('error', () => { if (loadingTrack || justSwitched || !currentTrack) return; showToast('Playback stalled'); if (activeQueue.upNext.length) selectNext() })
     // Audio element integrity check: if the hardware ever starts playing a track
     // different from what the UI is showing, halt it and resync instead of

@@ -50,14 +50,34 @@ export function playUpcoming(track) {
   queue.update(value => ({ ...value, history: value.nowPlaying ? [...value.history, value.nowPlaying] : value.history, nowPlaying: track, upNext: value.upNext.filter(item => item.videoId !== track.videoId) }))
 }
 
-export function playNext(track) {
-  const queued = { ...track, queueSource: 'manual' }
+export function playNext(track, queueSource = 'manual') {
+  const queued = { ...track, queueSource }
   queue.update(value => ({ ...value, upNext: [queued, ...value.upNext.filter(item => item.videoId !== queued.videoId)] }))
 }
 
-export function addToQueue(track) {
-  const queued = { ...track, queueSource: 'manual' }
+export function addToQueue(track, queueSource = 'manual') {
+  const queued = { ...track, queueSource }
   queue.update(value => ({ ...value, upNext: [...value.upNext.filter(item => item.videoId !== queued.videoId), queued] }))
+}
+
+// Replace only the party-owned portion of the upcoming queue with the
+// server's authoritative vote/priority order. Radio and listener-added tracks
+// remain untouched, while removed guest requests disappear after moderation.
+export function reconcilePartyQueue(tracks) {
+  const partyTracks = (tracks || [])
+    .filter(track => track?.videoId)
+    .map(track => ({ ...track, queueSource: 'party' }))
+  const partyIds = new Set(partyTracks.map(track => track.videoId))
+  const priority = partyTracks.filter(track => track.priority)
+  const regular = partyTracks.filter(track => !track.priority)
+  queue.update(value => ({
+    ...value,
+    upNext: [
+      ...priority,
+      ...value.upNext.filter(track => track.queueSource !== 'party' && !partyIds.has(track.videoId)),
+      ...regular,
+    ],
+  }))
 }
 
 export function appendTracks(tracks) {

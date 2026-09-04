@@ -78,6 +78,7 @@
   let partyBlockDuplicates = true
   let partyGuestQuota = 3
   let partyCooldownSeconds = 30
+  let isLaunching = false
   let partyEndConfirmOpen = false
 
   function requestFlush(event) {
@@ -483,16 +484,25 @@
     }
   }
 
-  function launchConfiguredParty() {
-    onPartyLaunch({
+  async function launchConfiguredParty() {
+    if (isLaunching) return
+    isLaunching = true
+    const payload = {
       host_name: partyHostName.trim() || 'Host',
       require_approval: partyRequireApproval,
       democratic_upvoting: partyDemocraticUpvoting,
+      max_song_duration: partyMaxSongMinutes * 60,
       max_song_duration_seconds: partyMaxSongMinutes * 60,
       block_duplicates: partyBlockDuplicates,
+      max_unplayed_per_guest: partyGuestQuota,
       guest_quota: partyGuestQuota,
       cooldown_seconds: partyCooldownSeconds,
-    })
+    }
+    try {
+      await onPartyLaunch(payload)
+    } finally {
+      isLaunching = false
+    }
   }
 
   function requestEndParty() {
@@ -836,7 +846,7 @@
     <footer class="bottom-dock" class:chrome-hidden={!chromeAwake}>
       <div class="dock-scrubber">
         <span>{formatTime(playbackTime)}</span>
-        <input type="range" min="0" max={playbackDuration || 0} value={playbackTime} step=".1" on:input={handleSeek} aria-label="Seek through track" />
+        <input type="range" min="0" max={playbackDuration || 0} value={playbackTime} step=".1" on:change={handleSeek} aria-label="Seek through track" />
         <span>{formatTime(playbackDuration)}</span>
       </div>
       <div class="dock-controls">
@@ -878,7 +888,7 @@
         <label class="party-range"><span>Max song duration <b>{partyMaxSongMinutes} min</b></span><input type="range" min="2" max="20" step="1" bind:value={partyMaxSongMinutes} /></label>
         <label class="party-range"><span>Guest quota <b>{partyGuestQuota} tracks</b></span><input type="range" min="1" max="10" step="1" bind:value={partyGuestQuota} /></label>
         <label class="party-range"><span>Request cooldown <b>{partyCooldownSeconds}s</b></span><input type="range" min="0" max="120" step="5" bind:value={partyCooldownSeconds} /></label>
-        <button class="party-launch" type="submit">Launch Party</button>
+        <button class="party-launch" type="submit" disabled={isLaunching}>{isLaunching ? 'Launching...' : 'Launch Party'}</button>
       </form>
     </div>
   {/if}
@@ -895,7 +905,7 @@
           <button class="round-button" on:pointerdown|preventDefault={() => onPartyOpen()} aria-label="Close party controls"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
         </header>
         {#if party.qrDataUrl}
-          <div class="party-qr"><img src={party.qrDataUrl} alt="QR code joining the party room {party.code}" /></div>
+          <div class="party-qr"><img src={`https://api.qrserver.com/v1/create-qr-code/?size=168x168&data=${encodeURIComponent(party.invite_url || party.inviteUrl || '')}`} alt="Party QR Code" /></div>
         {/if}
         {#if pendingCount}
           <div class="party-request-banner" role="status">

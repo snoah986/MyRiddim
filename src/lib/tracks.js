@@ -1,4 +1,5 @@
 const PLACEHOLDER_TITLES = new Set(['unknown', 'unknown title', 'unknown audio', 'untitled', ''])
+const PLACEHOLDER_ARTISTS = new Set(['unknown', 'unknown artist', 'unknown audio', 'untitled', ''])
 
 function textValue(value) {
   if (typeof value === 'string' || typeof value === 'number') return String(value)
@@ -49,10 +50,10 @@ export function normalizeTrack(track) {
   if (!track || typeof track !== 'object') return null
 
   const title = cleanText(track.title) || cleanText(track.name) || cleanText(track.headline)
-  const artist = cleanText(artistValue(track.artists || track.artist || track.author)) || 'Various Artists'
+  const artist = cleanText(artistValue(track.artists || track.artist || track.author))
   const videoId = cleanText(track.videoId || track.id || track.track_id)
   const thumbnail = artworkValue(track)
-  if (!videoId || !title || PLACEHOLDER_TITLES.has(title.toLowerCase()) || !thumbnail) return null
+  if (!videoId || !title || !artist || PLACEHOLDER_TITLES.has(title.toLowerCase()) || PLACEHOLDER_ARTISTS.has(artist.toLowerCase()) || !thumbnail) return null
 
   return {
     ...track,

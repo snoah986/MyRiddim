@@ -1,4 +1,4 @@
-"""Local YouTube Music API bridge."""
+﻿"""Local YouTube Music API bridge."""
 from pathlib import Path
 import json
 import os
@@ -95,7 +95,7 @@ def party_create():
     settings = data.get("settings")
     if isinstance(settings, dict):
         PartyStore.update_settings(room, settings)
-    return jsonify({"code": room.code, "invite_url": party_invite_url(room.code), **room.public_state()}), 201
+    return jsonify({"code": room.code, "room_code": room.code, "invite_url": party_invite_url(room.code), **room.public_state()}), 201
 
 
 def _lan_ip():
@@ -1234,7 +1234,9 @@ def normalize_track(item):
     artist = clean(artist)
     track_id = clean(track_id)
     placeholder_titles = {"unknown", "unknown title", "unknown audio", "untitled", ""}
-    if not title or not track_id or title.lower() in placeholder_titles or not artwork_url:
+    placeholder_artists = {"unknown", "unknown artist", "unknown audio", "untitled", ""}
+    if (not title or not track_id or title.lower() in placeholder_titles or
+            not artist or artist.lower() in placeholder_artists or not artwork_url):
         return None
     duration = item.get("duration") or item.get("duration_seconds") or item.get("length") or item.get("lengthSeconds") or 0
     return {
@@ -3783,10 +3785,21 @@ def proxy_stream(video_id):
         print(f"Proxy stream failed for video_id={video_id}: {exc}", flush=True)
         return jsonify({"error": str(exc)}), 502
 
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+@app.route("/mobile")
+def serve_mobile():
+    return send_from_directory(STATIC_DIR, "mobile.html")
+
 if __name__ == "__main__":
     # LAN/VPN remote mode is opt-in. Keep localhost as the safe default because
     # this process holds the user's Google session cookies. For an iPhone on a
     # trusted home LAN, set YTM_BIND_HOST=0.0.0.0 and optionally restrict
     # YTM_CORS_ORIGINS to the exact frontend origin.
     host = os.getenv("YTM_BIND_HOST", "127.0.0.1")
-    app.run(host=host, port=int(os.getenv("YTM_BACKEND_PORT", "5178")), debug=False)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("YTM_BACKEND_PORT", 5178))
+    app.run(host="0.0.0.0", port=port, debug=False)

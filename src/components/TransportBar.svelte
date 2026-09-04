@@ -44,11 +44,11 @@
         <button class="icon-button" on:click={onNext} aria-label="Next track" title="Next"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M16 6h2v12h-2zM4 6l10 6-10 6z"></path></svg></button>
         <button class:active={repeat !== 'off'} class="icon-button" on:click={onRepeat} aria-label={`Repeat: ${repeat}`} title={`Repeat: ${repeat}`}><svg viewBox="0 0 24 24"><path d="m17 2 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"></path></svg>{#if repeat === 'one'}<b>1</b>{/if}</button>
       </div>
-      <div class="scrubber"><span>{formatTime(currentTime)}</span><input aria-label="Seek" type="range" min="0" max={duration || 0} step=".1" value={currentTime} on:input={onSeek} /><span>{formatTime(duration)}</span></div>
+      <div class="scrubber"><span>{formatTime(currentTime)}</span><input aria-label="Seek" type="range" min="0" max={duration || 0} step=".1" value={currentTime} on:change={onSeek} /><span>{formatTime(duration)}</span></div>
     </div>
 
     <div class="transport-actions">
-      <label class="volume" aria-label="Volume"><svg viewBox="0 0 24 24"><path d="M4 10v4h4l5 4V6l-5 4H4zm12.5-2a6 6 0 0 1 0 8M19 5a10 10 0 0 1 0 14"></path></svg><input type="range" min="0" max="1" step=".01" value={volume} on:input={onVolume} /></label>
+      <label class="volume" aria-label="Volume"><svg viewBox="0 0 24 24"><path d="M4 10v4h4l5 4V6l-5 4H4zm12.5-2a6 6 0 0 1 0 8M19 5a10 10 0 0 1 0 14"></path></svg><input type="range" min="0" max="1" step=".01" value={volume} on:change={onVolume} /></label>
       <button class="icon-button" on:click={onQueue} aria-label="Open playback queue" title="Queue"><svg viewBox="0 0 24 24"><path d="M4 6h12M4 12h16M4 18h9"></path></svg></button>
       <button class="icon-button" on:click={onTheatre} aria-label="Open Theatre Mode" title="Theatre Mode"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="m9 9 5 3-5 3z"></path></svg></button>
       <button class="icon-button" on:click={onPip} aria-label="Open mini player" title="Mini player"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"></rect><rect x="12" y="12" width="7" height="6" rx="1.5"></rect></svg></button>

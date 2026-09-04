@@ -1,4 +1,4 @@
-use std::process::Command as StdCommand;
+﻿use std::process::Command as StdCommand;
 use std::sync::Mutex;
 
 use tauri::menu::{Menu, MenuItem};
@@ -69,7 +69,7 @@ fn spawn_backend(app: &tauri::AppHandle) -> Option<BackendChild> {
     let port = std::env::var("YTM_BACKEND_PORT").unwrap_or("5178".into());
     if let Ok(command) = app.shell().sidecar("ytm-backend") {
         let command = command
-            .env("YTM_BACKEND_PORT", port)
+            .env("YTM_BACKEND_PORT", &port)
             .env("PYTHONUNBUFFERED", "1");
         let command = if let Some(dir) = data_dir.as_ref() {
             command.env("YTM_DATA_DIR", dir)
@@ -87,7 +87,7 @@ fn spawn_backend(app: &tauri::AppHandle) -> Option<BackendChild> {
     let mut command = StdCommand::new("python");
     command
         .arg(script.clone())
-        .env("YTM_BACKEND_PORT", port)
+        .env("YTM_BACKEND_PORT", &port)
         .env("PYTHONUNBUFFERED", "1");
     if let Some(dir) = data_dir {
         command.env("YTM_DATA_DIR", dir);

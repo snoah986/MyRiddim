@@ -1,3 +1,19 @@
+﻿import os
+import socket
+
+def get_lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+    except Exception:
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            lan_ip = "127.0.0.1"
+    finally:
+        s.close()
+    return lan_ip
 """Party Mode: the host-side jukebox engine.
 
 One in-memory PartyStore owns all party state. Rooms live only on the host
@@ -130,7 +146,7 @@ class PartyRoom:
     def unplayed_count(self, guest_id: str) -> int:
         return sum(
             1 for track in self.tracks.values()
-            if track.requested_by == guest_id and track.status == "queued"
+            if track.requested_by == guest_id and track.status in ("pending", "queued", "playing")
         )
 
     def remaining_cooldown(self, guest: PartyGuest) -> int:
@@ -385,3 +401,4 @@ class PartyStore:
 
 
 PARTY_STORE = PartyStore()
+
