@@ -44,6 +44,8 @@
   export let onPartyReject = () => {}
   export let onPartyOpen = () => {} // request the popover (App owns room lifecycle)
   export let partyPopoverOpen = false
+  export let partySetupOpen = false
+  export let onPartyLaunch = () => {}
   export let onPartyRole = () => {}
   export let onPartyKick = () => {}
   export let onPartySetting = () => {}
@@ -69,6 +71,14 @@
   let saveToastTimer
   let flushTimer
   let flushProgress = 0
+  let partyHostName = 'Host'
+  let partyRequireApproval = false
+  let partyDemocraticUpvoting = true
+  let partyMaxSongMinutes = 7
+  let partyBlockDuplicates = true
+  let partyGuestQuota = 3
+  let partyCooldownSeconds = 30
+  let partyEndConfirmOpen = false
 
   function requestFlush(event) {
     event?.preventDefault()
@@ -360,7 +370,9 @@
       return
     }
     if (event.key === 'Escape') {
-      if (queueOpen) onQueue()
+      if (partySetupOpen) onPartyOpen()
+      else if (partyEndConfirmOpen) partyEndConfirmOpen = false
+      else if (queueOpen) onQueue()
       else if (isVideoMode) exitVideoMode(true)
       else onClose()
     }
@@ -469,6 +481,27 @@
       await tick()
       onToggle()
     }
+  }
+
+  function launchConfiguredParty() {
+    onPartyLaunch({
+      host_name: partyHostName.trim() || 'Host',
+      require_approval: partyRequireApproval,
+      democratic_upvoting: partyDemocraticUpvoting,
+      max_song_duration_seconds: partyMaxSongMinutes * 60,
+      block_duplicates: partyBlockDuplicates,
+      guest_quota: partyGuestQuota,
+      cooldown_seconds: partyCooldownSeconds,
+    })
+  }
+
+  function requestEndParty() {
+    partyEndConfirmOpen = true
+  }
+
+  function finishParty(mode) {
+    partyEndConfirmOpen = false
+    onPartyEnd(mode)
   }
 
   function toggleLyrics() {
@@ -793,6 +826,7 @@
           <section class="metadata">
             <h1>{clean(track?.title) || 'No Track Selected'}</h1>
             <p>{clean(track?.artist) || 'Unknown Artist'}</p>
+            {#if track?.requested_by}<div class="requested-by">Requested by {clean(track.requested_by)}</div>{/if}
             <div class="metadata-subline"><span class="micro-badge">{statusLabel}</span>{#if clean(track?.album)}<span>{clean(track.album)}</span>{/if}</div>
           </section>
         </section>
@@ -828,6 +862,27 @@
     </footer>
   </div>
 
+  {#if partySetupOpen && !party}
+    <div class="party-overlay" role="presentation" on:pointerdown|self={() => onPartyOpen()}>
+      <form class="party-popover party-setup" role="dialog" tabindex="-1" aria-modal="true" aria-label="Set up Party Mode" on:submit|preventDefault={launchConfiguredParty}>
+        <header class="party-head">
+          <div><span class="queue-kicker">PARTY MODE</span><h2 class="party-code">Set up your room</h2></div>
+          <button type="button" class="round-button" on:pointerdown|preventDefault={onPartyOpen} aria-label="Close Party Mode setup"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
+        </header>
+        <label class="party-field"><span>Host name</span><input bind:value={partyHostName} maxlength="24" autocomplete="nickname" placeholder="Host" /></label>
+        <div class="party-setting-grid">
+          <label><span>Require approvals</span><input type="checkbox" bind:checked={partyRequireApproval} /></label>
+          <label><span>Democratic upvoting</span><input type="checkbox" bind:checked={partyDemocraticUpvoting} /></label>
+          <label><span>Block duplicates</span><input type="checkbox" bind:checked={partyBlockDuplicates} /></label>
+        </div>
+        <label class="party-range"><span>Max song duration <b>{partyMaxSongMinutes} min</b></span><input type="range" min="2" max="20" step="1" bind:value={partyMaxSongMinutes} /></label>
+        <label class="party-range"><span>Guest quota <b>{partyGuestQuota} tracks</b></span><input type="range" min="1" max="10" step="1" bind:value={partyGuestQuota} /></label>
+        <label class="party-range"><span>Request cooldown <b>{partyCooldownSeconds}s</b></span><input type="range" min="0" max="120" step="5" bind:value={partyCooldownSeconds} /></label>
+        <button class="party-launch" type="submit">Launch Party</button>
+      </form>
+    </div>
+  {/if}
+
   {#if partyPopoverOpen && party}
     <div class="party-overlay" role="presentation" on:pointerdown|self={() => onPartyOpen()}>
       <div class="party-popover" role="dialog" tabindex="-1" aria-modal="true" aria-label="Party Mode host controls">
@@ -835,11 +890,18 @@
           <div>
             <span class="queue-kicker">PARTY MODE</span>
             <h2 class="party-code">{party.code}</h2>
+            <span class="party-live-label">{connectedGuests.length} guest{connectedGuests.length === 1 ? '' : 's'} connected</span>
           </div>
           <button class="round-button" on:pointerdown|preventDefault={() => onPartyOpen()} aria-label="Close party controls"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
         </header>
         {#if party.qrDataUrl}
           <div class="party-qr"><img src={party.qrDataUrl} alt="QR code joining the party room {party.code}" /></div>
+        {/if}
+        {#if pendingCount}
+          <div class="party-request-banner" role="status">
+            <div><strong>{pendingCount} request{pendingCount === 1 ? '' : 's'} need attention</strong><small>{party.pending[0].requested_by} · {party.pending[0].title}{#if party.pending[0].approval_reason === 'play_next'} · Play Next{/if}</small></div>
+            <span><button on:click={() => onPartyApprove(party.pending[0].videoId)} aria-label="Approve latest party request">Approve</button><button class="quiet" on:click={() => onPartyReject(party.pending[0].videoId)} aria-label="Dismiss latest party request">Dismiss</button></span>
+          </div>
         {/if}
         <div class="party-invite">
           <span class="party-link">{party.inviteUrl || party.code}</span>
@@ -880,7 +942,15 @@
           <label><input type="checkbox" checked={party.settings?.require_approval} on:change={(event) => onPartySetting?.('require_approval', event.currentTarget.checked)} /> Require approval</label>
           <label><input type="checkbox" checked={party.settings?.democratic_upvoting} on:change={(event) => onPartySetting?.('democratic_upvoting', event.currentTarget.checked)} /> Democratic upvoting</label>
         </div>
-        <button class="party-end" on:click={() => onPartyEnd?.()}>End party</button>
+        {#if partyEndConfirmOpen}
+          <div class="party-end-confirm" role="group" aria-label="Choose how to end the party">
+            <strong>End this party?</strong><small>Choose what happens to guest tracks.</small>
+            <div><button on:click={() => finishParty('save')}>Save as playlist</button><button on:click={() => finishParty('keep')}>Keep in queue</button><button class="danger" on:click={() => finishParty('wipe')}>Wipe guest tracks</button></div>
+            <button class="party-cancel-end" on:click={() => partyEndConfirmOpen = false}>Cancel</button>
+          </div>
+        {:else}
+          <button class="party-end" on:click={requestEndParty}>End party</button>
+        {/if}
       </div>
     </div>
   {/if}
@@ -946,7 +1016,7 @@
   .art-frame { position:relative; z-index:1; width:min(100%,430px); aspect-ratio:1; overflow:hidden; border:1px solid #ffffff1a; border-radius:30px; background:#0b0b0d; box-shadow:0 30px 90px #000b,0 0 60px #0008; transform-style:preserve-3d; transition:transform .55s cubic-bezier(.2,.8,.2,1),width .45s ease,height .45s ease,border-radius .45s ease; }.art-frame.video-frame { width:100%; height:100%; max-width:1080px; aspect-ratio:16 / 9; border-radius:24px; }.art-frame.tilt-reset { transition:transform .65s cubic-bezier(.2,.8,.2,1); }.art,.native-video { display:block; width:100%; height:100%; object-fit:cover; }.native-video { position:absolute; inset:0; object-fit:contain; background:#000; cursor:pointer; }.placeholder { display:grid; place-items:center; color:#fff; background:linear-gradient(135deg,#252331,#4d3640); font-size:7rem; }
   .art-button { position:relative; display:block; width:100%; height:100%; padding:0; border:0; color:inherit; background:none; cursor:pointer; }.art-button:disabled { cursor:default; }.art-button:focus-visible,.queue-item:focus-visible,.text-pill:focus-visible,.icon-button:focus-visible,.skip-button:focus-visible,.play-button:focus-visible { outline:2px solid #fff; outline-offset:4px; }.art-hint { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:.55rem; color:#fff; background:#0008; opacity:0; transition:opacity .25s ease; }.art-button:hover .art-hint,.art-button:focus-visible .art-hint { opacity:1; }.art-hint svg { width:45px; height:45px; padding:13px; border:1px solid #ffffff55; border-radius:50%; fill:currentColor; }.art-hint span { padding:.3rem .65rem; border-radius:999px; background:#000a; font-size:.68rem; font-weight:700; }
   .native-video-shell { position:absolute; inset:0; display:grid; place-items:center; background:#000; }.video-message { position:relative; z-index:2; display:flex; align-items:center; gap:.55rem; color:#ffffffb8; font-size:.75rem; }.video-message > span { width:.45rem; height:.45rem; border-radius:50%; background:#34d399; box-shadow:0 0 12px #34d399; animation:pulse 1s ease-in-out infinite alternate; }.video-message.error { flex-direction:column; max-width:80%; color:#ffffff99; text-align:center; }.video-message.error strong { color:#fca5a5; }.video-message small { overflow-wrap:anywhere; }@keyframes pulse { to { opacity:.3; transform:scale(.7); } }.video-exit { position:absolute; top:1rem; left:1rem; z-index:4; display:flex; align-items:center; gap:.35rem; padding:.5rem .8rem; border:1px solid #ffffff1a; border-radius:999px; color:#ffffffd9; background:#0009; cursor:pointer; font-size:.72rem; opacity:0; backdrop-filter:blur(16px); transition:opacity .25s ease,background .2s ease; }.art-frame.video-frame:hover .video-exit,.video-exit:focus-visible { opacity:1; }.video-exit:hover { background:#000; }.video-exit svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-  .metadata { width:min(100%,600px); margin-top:1.25rem; text-align:center; }.metadata h1 { margin:0; overflow:hidden; color:#fff; font-size:clamp(1.5rem,3vw,2.15rem); font-weight:750; letter-spacing:-.035em; line-height:1.12; text-overflow:ellipsis; white-space:nowrap; }.metadata p { margin:.42rem 0 0; color:#ffffff99; font-size:clamp(.86rem,1.5vw,1rem); font-weight:500; }.metadata-subline { display:flex; align-items:center; justify-content:center; gap:.55rem; margin-top:.65rem; color:#ffffff58; font-size:.7rem; }.micro-badge { display:inline-flex; align-items:center; padding:.2rem .45rem; border-radius:5px; color:#ffffff9c; background:#ffffff10; font:700 .56rem/1 Inter,ui-sans-serif,sans-serif; letter-spacing:.12em; }
+  .metadata { width:min(100%,600px); margin-top:1.25rem; text-align:center; }.requested-by { display:inline-flex; margin-top:.6rem; padding:.28rem .55rem; border:1px solid #ffffff18; border-radius:999px; color:#ffffff9c; background:#ffffff0a; font-size:.64rem; font-weight:650; }.metadata h1 { margin:0; overflow:hidden; color:#fff; font-size:clamp(1.5rem,3vw,2.15rem); font-weight:750; letter-spacing:-.035em; line-height:1.12; text-overflow:ellipsis; white-space:nowrap; }.metadata p { margin:.42rem 0 0; color:#ffffff99; font-size:clamp(.86rem,1.5vw,1rem); font-weight:500; }.metadata-subline { display:flex; align-items:center; justify-content:center; gap:.55rem; margin-top:.65rem; color:#ffffff58; font-size:.7rem; }.micro-badge { display:inline-flex; align-items:center; padding:.2rem .45rem; border-radius:5px; color:#ffffff9c; background:#ffffff10; font:700 .56rem/1 Inter,ui-sans-serif,sans-serif; letter-spacing:.12em; }
 
   .bottom-dock { position:fixed; left:50%; bottom:1.5rem; z-index:40; display:flex; flex-direction:column; gap:.75rem; width:92%; max-width:900px; padding:.85rem 1.25rem .8rem; border:1px solid #ffffff16; border-radius:28px; background:#0c0c0cc7; box-shadow:0 24px 70px #000b; backdrop-filter:blur(28px) saturate(1.2); transform:translateX(-50%); transition:opacity .2s ease; }.dock-scrubber { display:flex; align-items:center; gap:.7rem; color:#ffffff72; font:500 .68rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums; }.dock-scrubber input { flex:1; min-width:0; height:4px; accent-color:#fff; cursor:pointer; transition:height .15s ease; }.dock-scrubber input:hover { height:7px; }.dock-controls { display:flex; align-items:center; justify-content:space-between; gap:1rem; }.transport-group { display:flex; align-items:center; gap:.45rem; }.secondary-left,.secondary-right { flex:1; }.secondary-right { justify-content:flex-end; }.icon-button,.skip-button,.play-button,.text-pill { display:inline-flex; align-items:center; justify-content:center; border:0; cursor:pointer; transition:transform .18s ease,background .18s ease,color .18s ease,box-shadow .18s ease; }.icon-button { width:34px; height:34px; border:1px solid transparent; border-radius:50%; color:#ffffff76; background:transparent; }.icon-button:hover,.icon-button.active { color:#fff; background:#ffffff10; }.icon-button svg,.skip-button svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.icon-button:nth-child(2) svg circle { fill:none; }.skip-button { width:38px; height:38px; border:1px solid #ffffff12; border-radius:50%; color:#fff; background:#ffffff08; }.skip-button:hover { background:#ffffff18; transform:scale(1.05); }.play-button { width:54px; height:54px; border-radius:50%; color:#090909; background:#fff; box-shadow:0 10px 28px #0009; }.play-button:hover { transform:scale(1.06); box-shadow:0 14px 34px #000c; }.play-button:active,.skip-button:active,.icon-button:active,.text-pill:active { transform:scale(.94); }.play-button svg { width:21px; height:21px; fill:currentColor; }.text-pill { gap:.42rem; min-height:34px; padding:.45rem .75rem; border:1px solid #ffffff14; border-radius:999px; color:#ffffffa3; background:#ffffff08; font-size:.7rem; font-weight:600; }.text-pill:hover { color:#fff; background:#ffffff15; }.text-pill.active { color:#111; border-color:#fff; background:#fff; }.text-pill svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.text-pill b { min-width:1.35em; padding:.12rem .3rem; border-radius:999px; color:#fff; background:#ffffff16; font-size:.58rem; text-align:center; }.text-pill.active b { color:#111; background:#0002; }
 
@@ -991,6 +1061,17 @@
 
 
   /* --- Party Mode (host pill + popover) --- */
+  .party-setup { gap:1.15rem; }
+  .party-field,.party-range { display:flex; flex-direction:column; gap:.45rem; color:#ffffffa8; font-size:.72rem; font-weight:650; }
+  .party-field input { width:100%; box-sizing:border-box; padding:.65rem .7rem; border:1px solid #ffffff18; border-radius:10px; color:#fff; background:#ffffff08; outline:none; font:inherit; }
+  .party-setting-grid { display:grid; grid-template-columns:1fr; gap:.4rem; padding:.7rem 0; border-top:1px solid #ffffff0d; border-bottom:1px solid #ffffff0d; }
+  .party-setting-grid label { display:flex; align-items:center; justify-content:space-between; gap:.75rem; color:#ffffffb0; font-size:.72rem; }
+  .party-setting-grid input,.party-settings input { width:15px; height:15px; accent-color:#fff; }
+  .party-range > span { display:flex; justify-content:space-between; gap:.75rem; }.party-range b { color:#fff; font:600 .65rem ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .party-range input { width:100%; accent-color:#fff; cursor:pointer; }
+  .party-launch { width:100%; padding:.7rem; border:1px solid #ffffff20; border-radius:12px; color:#090909; background:#fff; cursor:pointer; font-size:.75rem; font-weight:750; transition:transform .18s ease,background .18s ease; }.party-launch:hover { background:#f2f2f2; transform:translateY(-1px); }
+  .party-live-label { display:block; margin-top:.35rem; color:#34d399b8; font-size:.65rem; }
+  .party-request-banner { display:flex; align-items:center; justify-content:space-between; gap:.75rem; padding:.65rem .7rem; border:1px solid #fbbf2430; border-radius:12px; background:#fbbf240c; }.party-request-banner > div { display:flex; min-width:0; flex-direction:column; gap:.25rem; }.party-request-banner strong { color:#fde68a; font-size:.68rem; }.party-request-banner small { overflow:hidden; color:#ffffff80; font-size:.62rem; text-overflow:ellipsis; white-space:nowrap; }.party-request-banner > span { display:flex; flex:0 0 auto; gap:.3rem; }.party-request-banner button { padding:.38rem .52rem; border:1px solid #fde68a38; border-radius:7px; color:#111; background:#fde68a; cursor:pointer; font-size:.6rem; font-weight:700; }.party-request-banner button.quiet { color:#fde68a; background:transparent; }
   .party-pill { gap:.42rem; min-height:34px; padding:.45rem .75rem; border:1px solid #ffffff14; border-radius:999px; color:#ffffffa3; background:#ffffff08; cursor:pointer; font-size:.7rem; font-weight:600; display:inline-flex; align-items:center; justify-content:center; transition:transform .18s ease,background .18s ease,color .18s ease; }
   .party-pill:hover { color:#fff; background:#ffffff15; }
   .party-pill:active { transform:scale(.94); }

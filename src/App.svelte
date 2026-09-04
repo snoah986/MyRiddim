@@ -40,7 +40,8 @@
   let oauthTab = 'paste', oauthClientId = '', oauthClientSecret = '', oauthDevice = null, oauthCode = '', oauthError = '', oauthBusy = false, setupTab = 'oauth'
   let currentTrack = null, currentIndex = -1, theatreOpen = false, toast = '', toastTimer, activeQueue = { history: [], nowPlaying: null, upNext: [], repeat: 'off', shuffle: false }, isPlaying = false, currentTime = 0, duration = 0, volume = 1, loadingTrack = false, listenRecorded = false, queueOpen = false, draggedIndex = -1, queueTab = 'queue', playbackRequest = 0, playbackAbort = null
   let remotePollTimer = null, remotePublishTimer = null, remoteCommandsBusy = false, remoteExecutedCommandIds = new Set()
-  let partyRoom = null, partyPopoverOpen = false, partyPollTimer = null, partyInviteBase = '', partyPlayedId = null
+  let partyRoom = null, partyPopoverOpen = false, partySetupOpen = false, partyPollTimer = null, partyInviteBase = '', partyPlayedId = null, partySkipHandledId = null
+  let partyQueueSnapshot = null
   const partyAppliedIds = new Set()
   let companionVideoId = null, companionForId = null, hasVideo = false, companionRequest = 0
   let quickPicks = [], recommendations = [], recommendationForId = null, recommendationLoading = false, recommendationRequest = 0, discoverTracks = [], discoverForId = null, discoverLoading = false, discoverRequest = 0, stats = { month: '', totalMinutes: 0, monthly: [], heavyRotation: [] }, searchQuery = '', searchResults = [], searchTimer, searchRequest = 0, searching = false, searchError = '', showCreate = false, newTitle = '', newDescription = '', preloadedTrackId = null
@@ -126,23 +127,53 @@
     if (!partyInviteBase) partyInviteBase = inviteUrl.split('?party=')[0]
     return { ...data, inviteUrl, qrDataUrl: `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(inviteUrl)}` }
   }
-  function openPartyPopover() { if (!partyRoom) createParty(); else partyPopoverOpen = !partyPopoverOpen }
-  async function createParty() {
+  function openPartyPopover() {
+    if (!partyRoom) partySetupOpen = !partySetupOpen
+    else partyPopoverOpen = !partyPopoverOpen
+  }
+  async function createParty(settings = {}) {
     try {
-      const response = await apiFetch('/api/party/create', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ host_name: 'Host' }) })
+      const response = await apiFetch('/api/party/create', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ host_name: settings.host_name || 'Host', settings }) })
       const data = await response.json()
       if (!response.ok || data.error) throw Error(data.error || 'Could not create the party room')
-      partyAppliedIds.clear(); partyPlayedId = null
+      partyAppliedIds.clear(); partyPlayedId = null; partySkipHandledId = null
+      partyQueueSnapshot = [...activeQueue.upNext]
       partyRoom = decorateParty(data)
+      partySetupOpen = false
       partyPopoverOpen = true
       clearInterval(partyPollTimer); partyPollTimer = setInterval(pollParty, 2000)
       showToast(`Party room ${data.code} is live`)
     } catch (error) { showToast(error.message || 'Could not create the party room') }
   }
-  function endPartyLocal() { clearInterval(partyPollTimer); partyPollTimer = null; partyRoom = null; partyPopoverOpen = false; partyAppliedIds.clear(); partyPlayedId = null }
-  function endParty() {
-    if (partyRoom?.code) apiFetch('/api/party/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code: partyRoom.code }) }).catch(() => {})
-    endPartyLocal(); showToast('Party ended')
+  function endPartyLocal() {
+    clearInterval(partyPollTimer)
+    partyPollTimer = null
+    partyRoom = null
+    partyPopoverOpen = false
+    partySetupOpen = false
+    partyAppliedIds.clear()
+    partyPlayedId = null
+    partySkipHandledId = null
+    partyQueueSnapshot = null
+  }
+  async function endParty(mode = 'keep') {
+    const room = partyRoom
+    if (!room?.code) return
+    const guestTracks = [...(room.history || []), ...(room.queue || [])]
+      .map(normalizePlayable)
+      .filter(Boolean)
+    if (mode === 'wipe') {
+      queue.set({ ...activeQueue, upNext: partyQueueSnapshot ? [...partyQueueSnapshot] : activeQueue.upNext.filter(item => !room.queue?.some(entry => entry.videoId === item.videoId)) })
+    } else if (mode === 'save') {
+      const created = await createPlaylistFromName(`Party Mix - ${new Date().toLocaleDateString()}`)
+      if (created) {
+        for (const item of guestTracks) await saveTrackToPlaylist(item, created.id)
+      }
+      queue.set({ ...activeQueue, upNext: partyQueueSnapshot ? [...partyQueueSnapshot] : activeQueue.upNext.filter(item => !room.queue?.some(entry => entry.videoId === item.videoId)) })
+    }
+    apiFetch('/api/party/close', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code: room.code }) }).catch(() => {})
+    endPartyLocal()
+    showToast(mode === 'save' ? 'Party session saved' : mode === 'wipe' ? 'Guest tracks removed' : 'Party ended')
   }
   async function partyAction(path, body = {}) {
     if (!partyRoom?.code) return
@@ -159,7 +190,10 @@
       if (command.action === 'add_to_queue' && command.payload?.videoId) {
         partyAppliedIds.add(command.payload.videoId)
         const track = normalizePlayable(command.payload)
-        if (track) addToQueue(track)
+        if (track) {
+          if (command.payload.priority) playNext(track)
+          else addToQueue(track)
+        }
       }
     }
   }
@@ -172,13 +206,22 @@
       if (!data.active) { endPartyLocal(); return }
       const previousPending = partyRoom.pending?.length || 0
       partyRoom = decorateParty({ ...partyRoom, ...data })
+      const activePartyTrack = data.active_track?.videoId
+      if (data.skip_requested && activePartyTrack && partySkipHandledId !== activePartyTrack) {
+        partySkipHandledId = activePartyTrack
+        await apiFetch('/api/party/played', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code: partyRoom.code, video_id: activePartyTrack }) }).catch(() => {})
+        next()
+      }
       // Reconcile queued guest requests into the local queue. The approve
       // path also lands here, guarded by partyAppliedIds.
       for (const entry of data.queue || []) {
         if (!entry.videoId || partyAppliedIds.has(entry.videoId)) continue
         partyAppliedIds.add(entry.videoId)
-        const track = normalizePlayable({ videoId: entry.videoId, title: entry.title, artist: entry.artist, thumbnail: entry.thumbnail, duration: entry.duration })
-        if (track) addToQueue(track)
+        const track = normalizePlayable({ videoId: entry.videoId, title: entry.title, artist: entry.artist, thumbnail: entry.thumbnail, duration: entry.duration, requested_by: entry.requested_by, priority: entry.priority })
+        if (track) {
+          if (entry.priority) playNext(track)
+          else addToQueue(track)
+        }
       }
       const pending = data.pending || []
       if (pending.length > previousPending) {
@@ -187,15 +230,21 @@
       }
     } catch { /* party polling is best-effort */ }
   }
-  async function reportPartyPlayed() {
-    if (!partyRoom?.code || !currentTrack?.videoId) return
-    try { await apiFetch('/api/party/played', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code: partyRoom.code, video_id: currentTrack.videoId }) }) } catch { /* best-effort */ }
+  async function reportPartyPlayed(track = currentTrack) {
+    if (!partyRoom?.code || !track?.videoId) return
+    try { await apiFetch('/api/party/played', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code: partyRoom.code, video_id: track.videoId }) }) } catch { /* best-effort */ }
+  }
+  function notifyPartyTrackStarted(track) {
+    if (!partyRoom?.code || !track?.videoId || partyPlayedId === track.videoId) return
+    partyPlayedId = track.videoId
+    reportPartyPlayed(track)
   }
   function onPartyApprove(videoId) { partyAction('approve', { video_id: videoId }) }
   function onPartyReject(videoId) { partyAction('reject', { video_id: videoId }) }
   function onPartyRole(guestId, role) { partyAction('role', { guest_id: guestId, role }) }
   function onPartyKick(guestId) { partyAction('kick', { guest_id: guestId }) }
   function onPartySetting(key, value) { partyAction('settings', { settings: { [key]: value } }) }
+  function launchParty(settings) { createParty(settings) }
   function onPartyCopyInvite() { if (partyRoom?.inviteUrl && navigator.clipboard) navigator.clipboard.writeText(partyRoom.inviteUrl).then(() => showToast('Invite link copied')).catch(() => {}) }
   async function waitForBackend(attempts = 20) {
     let lastError
@@ -809,6 +858,7 @@
     const streamTrackId = track.canonicalId || track.videoId
     const gaplessHandoff = audio.gapFilled && track.videoId === activeQueue.nowPlaying?.videoId
     currentTrack = track; currentIndex = index; listenRecorded = false; preloadedTrackId = null; loadingTrack = true; isPlaying = true
+    notifyPartyTrackStarted(track)
     // Unified audio-state lock: abort any in-flight stream fetch and clear both
     // media buffers before the new request can resolve. A gapless handoff is
     // already playing the requested track on the other engine element, so it
@@ -1043,7 +1093,7 @@
   async function recordListen() {
     if (!currentTrack || listenRecorded) return
     listenRecorded = true
-    if (partyRoom?.code && partyPlayedId !== currentTrack.videoId) { partyPlayedId = currentTrack.videoId; reportPartyPlayed() }
+    notifyPartyTrackStarted(currentTrack)
     await apiFetch('/api/track/listen', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({video_id: currentTrack.videoId, title: currentTrack.title, artist: currentTrack.artist, album: currentTrack.album, thumbnail_url: currentTrack.thumbnail, listen_duration_seconds: Math.round(currentTime)}) })
     // Playback reporting: tell YouTube Music's watch history we played this
     // track so the recommendation engine learns from actual listening. The
@@ -1184,8 +1234,7 @@
 {#if settingsOpen}<SettingsModal onClose={() => settingsOpen = false} onDisconnect={reauthenticate} onToast={showToast} onDataRefresh={refreshAfterAuth} />{/if}
 {#if toast}<div class="toast" role="status">{toast}</div>{/if}
 {#if dragActive}<div class="drop-overlay" aria-hidden="true"><div class="drop-card"><strong>Drop to add to your library</strong><span>mp3, flac, wav, m4a</span></div></div>{/if}
-<TransportBar track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} volume={volume} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} loading={loadingTrack} onPrevious={previous} onToggle={togglePlay} onNext={next} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onSeek={seek} onVolume={setVolume} onQueue={() => queueOpen = !queueOpen} onTheatre={() => theatreOpen = true} onPip={togglePip} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenArtist={openArtistEntity} />
-{#if theatreOpen}<TheatreMode track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} hasVideo={hasVideo} companionVideoId={companionVideoId} history={activeQueue.history} upNext={activeQueue.upNext} recommendations={recommendations} onClose={() => theatreOpen = false} party={partyRoom} partyPopoverOpen={partyPopoverOpen} onPartyOpen={openPartyPopover} onPartyApprove={onPartyApprove} onPartyReject={onPartyReject} onPartyRole={onPartyRole} onPartyKick={onPartyKick} onPartySetting={onPartySetting} onPartyCopyInvite={onPartyCopyInvite} onPartyEnd={endParty} queueOpen={queueOpen} onQueue={() => queueOpen = !queueOpen} onToggle={togglePlay} onNext={next} onPrevious={previous} onSeek={seek} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onPlayQueue={jumpTo} onPlayRecommendation={startMix} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onSaveToPlaylist={saveTrackToPlaylist} playlists={playlists} onCreatePlaylist={createPlaylistFromName} onFavorite={toggleTrackFavorite} onRemoveUpcoming={(track) => removeUpcoming(track?.videoId)} onClearQueue={clearUpcoming} onClearManualQueue={flushManualQueue} onReorder={(from, to) => reorderUpcoming(from, to)} onStartMix={startMix} />{/if}
+<TransportBar track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} volume={volume} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} loading={loadingTrack} onPrevious={previous} onToggle={togglePlay} onNext={next} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onSeek={seek} onVolume={setVolume} onQueue={() => queueOpen = !queueOpen} onTheatre={() => theatreOpen = true} onPip={togglePip} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenArtist={openArtistEntity} />  {#if theatreOpen}<TheatreMode track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} hasVideo={hasVideo} companionVideoId={companionVideoId} history={activeQueue.history} upNext={activeQueue.upNext} recommendations={recommendations} onClose={() => theatreOpen = false} party={partyRoom} partyPopoverOpen={partyPopoverOpen} partySetupOpen={partySetupOpen} onPartyOpen={openPartyPopover} onPartyLaunch={launchParty} onPartyApprove={onPartyApprove} onPartyReject={onPartyReject} onPartyRole={onPartyRole} onPartyKick={onPartyKick} onPartySetting={onPartySetting} onPartyCopyInvite={onPartyCopyInvite} onPartyEnd={endParty} queueOpen={queueOpen} onQueue={() => queueOpen = !queueOpen} onToggle={togglePlay} onNext={next} onPrevious={previous} onSeek={seek} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onPlayQueue={jumpTo} onPlayRecommendation={startMix} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onSaveToPlaylist={saveTrackToPlaylist} playlists={playlists} onCreatePlaylist={createPlaylistFromName} onFavorite={toggleTrackFavorite} onRemoveUpcoming={(track) => removeUpcoming(track?.videoId)} onClearQueue={clearUpcoming} onClearManualQueue={flushManualQueue} onReorder={(from, to) => reorderUpcoming(from, to)} onStartMix={startMix} />{/if}
 {#if queueOpen && !theatreOpen}<aside class="queue-drawer" class:over-theatre={theatreOpen} aria-label="Playback queue"><div class="queue-head"><h2>Playback Manager</h2><button class="queue-close" on:pointerdown|preventDefault={() => queueOpen = false} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); queueOpen = false } }} aria-label="Close queue" title="Close queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18 18 6M6 6l12 12"></path></svg></button></div><div class="queue-tabs" role="tablist" aria-label="Playback manager views"><button class:active={queueTab === 'queue'} role="tab" aria-selected={queueTab === 'queue'} on:click={() => queueTab = 'queue'}>Up Next <span>{activeQueue.upNext.length}</span></button><button class:active={queueTab === 'recommendations'} role="tab" aria-selected={queueTab === 'recommendations'} on:click={() => queueTab = 'recommendations'}>Recommended <span>{recommendations.length}</span></button></div>{#if queueTab === 'queue'}<div class="queue-section"><h3>History <span>{activeQueue.history.length}</span></h3>{#if activeQueue.history.length}<div class="history-row"><span class="queue-art">{#if activeQueue.history.at(-1).thumbnail}<img src={activeQueue.history.at(-1).thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="queue-title">{clean(activeQueue.history.at(-1).title)}<small>{clean(activeQueue.history.at(-1).artist)}</small></span></div>{:else}<p class="empty">Nothing played yet</p>{/if}</div><div class="queue-section upcoming"><div class="upcoming-head"><h3>Up Next <span>{activeQueue.upNext.length}</span></h3><button on:click={clearUpcoming} disabled={!activeQueue.upNext.length}>Clear</button></div>{#each activeQueue.upNext as item, index (item.videoId)}<div class="queue-row" class:dragging={draggedIndex === index} role="listitem" draggable="true" on:dragstart={() => dragStart(index)} on:dragend={() => draggedIndex = -1} on:dragover|preventDefault on:drop={() => dropAt(index)}><span class="grip">⋮⋮</span><button class="queue-item" on:click={() => jumpTo(item)}><span class="queue-art">{#if item.thumbnail}<img src={item.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="queue-title">{clean(item.title)}<small>{clean(item.artist)}</small></span></button><button class="remove" on:click={() => removeUpcoming(item.videoId)} aria-label="Remove {clean(item.title)}">×</button><TrackContextMenu track={item} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} /></div>{/each}{#if !activeQueue.upNext.length}<p class="empty">Queue is empty</p>{/if}</div>{:else}<div class="queue-recommendations">{#if recommendations.length}{#each recommendations as rec, index (rec.videoId || index)}<div class="queue-recommendation-row mixable-track"><button class="queue-item" on:click={() => playQueue([rec])}><span class="queue-art">{#if rec.thumbnail}<img src={rec.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="queue-title">{clean(rec.title)}<small>{clean(rec.artist)}</small></span></button><button class="queue-add" on:click={() => appendTrack(rec)} aria-label="Add {clean(rec.title)} to queue">＋</button><StartMixButton track={rec} onStartMix={startMix} /></div>{/each}{:else}<div class="queue-empty-state"><strong>No recommendations loaded</strong><span>Play a track to discover similar songs.</span></div>{/if}</div>{/if}</aside>{/if}
 
 <style>

@@ -92,6 +92,9 @@ def party_state():
 def party_create():
     data = request.get_json(silent=True) or {}
     room = PARTY_STORE.create_room(clean(data.get("host_name")) or "Host")
+    settings = data.get("settings")
+    if isinstance(settings, dict):
+        PartyStore.update_settings(room, settings)
     return jsonify({"code": room.code, "invite_url": party_invite_url(room.code), **room.public_state()}), 201
 
 
@@ -185,6 +188,7 @@ def party_request_track():
         commands = [{"action": "add_to_queue", "payload": {
             "videoId": entry["videoId"], "title": entry["title"], "artist": entry["artist"],
             "thumbnail": entry["thumbnail"], "duration": entry["duration"],
+            "requested_by": entry.get("requested_by"), "priority": entry.get("priority", False),
         }}]
         # Party transitions must stay gapless: start buffering the audio the
         # moment a request is auto-approved.
@@ -219,6 +223,7 @@ def party_approve():
     commands = [{"action": "add_to_queue", "payload": {
         "videoId": entry["videoId"], "title": entry["title"], "artist": entry["artist"],
         "thumbnail": entry["thumbnail"], "duration": entry["duration"],
+        "requested_by": entry.get("requested_by"), "priority": entry.get("priority", False),
     }}]
     # Approved tracks join the live queue: pre-cache so the transition is gapless.
     download_to_cache(entry["videoId"], auth_headers())
@@ -267,17 +272,7 @@ def party_settings():
     updates = data.get("settings")
     if not isinstance(updates, dict):
         return jsonify({"error": "settings must be an object"}), 400
-    with room.lock:
-        if "require_approval" in updates:
-            room.settings["require_approval"] = bool(updates["require_approval"])
-        if "democratic_upvoting" in updates:
-            room.settings["democratic_upvoting"] = bool(updates["democratic_upvoting"])
-        for key in ("max_unplayed_per_guest", "cooldown_seconds"):
-            if key in updates:
-                try:
-                    room.settings[key] = max(0, int(updates[key]))
-                except (TypeError, ValueError):
-                    pass
+    PartyStore.update_settings(room, updates)
     return jsonify({"success": True, **room.public_state()})
 
 
@@ -290,6 +285,24 @@ def party_mark_played():
         return jsonify({"error": "Room not found"}), 404
     PartyStore.mark_played(room, clean(data.get("video_id")))
     return jsonify({"success": True, **room.public_state()})
+
+
+@app.post("/api/party/skip")
+def party_vote_skip():
+    """Guests vote to skip the current track; the host applies the returned
+    command on its next state poll once half of connected guests have voted."""
+    data = request.get_json(silent=True) or {}
+    room = PARTY_STORE.get_room(clean(data.get("code")))
+    if not room:
+        return jsonify({"error": "Room not found"}), 404
+    guest = PartyStore.touch(room, clean(data.get("guest_id")))
+    if not guest:
+        return jsonify({"error": "Unknown guest — rejoin the party", "rejoin": True}), 401
+    result = PartyStore.vote_skip(room, guest)
+    if result is None:
+        return jsonify({"error": "Skip voting is not allowed"}), 403
+    votes, threshold, requested = result
+    return jsonify({"votes": votes, "threshold": threshold, "skip_requested": requested, **room.public_state()})
 
 
 def _user_data_dir():

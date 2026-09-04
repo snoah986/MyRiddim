@@ -34,6 +34,22 @@ def _now() -> float:
     return time.time()
 
 
+def _duration_seconds(value) -> float:
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    text = str(value or '').strip()
+    if ':' in text:
+        try:
+            minutes, seconds = text.split(':', 1)
+            return max(0.0, int(minutes) * 60 + float(seconds))
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return max(0.0, float(text))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class PartyGuest:
     __slots__ = ("id", "name", "role", "joined_at", "last_seen", "last_request_at")
 
@@ -55,7 +71,7 @@ class PartyGuest:
 
 
 class PartyTrack:
-    __slots__ = ("video_id", "title", "artist", "thumbnail", "duration", "requested_by", "requested_by_name", "votes", "status", "created_at")
+    __slots__ = ("video_id", "title", "artist", "thumbnail", "duration", "requested_by", "requested_by_name", "votes", "status", "created_at", "priority", "approval_reason")
 
     def __init__(self, track: dict, guest) -> None:
         self.video_id = track.get("videoId") or track.get("id") or ""
@@ -68,6 +84,8 @@ class PartyTrack:
         self.votes = set()
         self.status = "pending"  # pending | queued | played | rejected
         self.created_at = _now()
+        self.priority = bool(track.get("play_next"))
+        self.approval_reason = track.get("approval_reason") or None
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +97,8 @@ class PartyTrack:
             "requested_by": self.requested_by_name,
             "votes": len(self.votes),
             "status": self.status,
+            "priority": self.priority,
+            "approval_reason": self.approval_reason,
         }
 
 
@@ -94,8 +114,13 @@ class PartyRoom:
             "max_unplayed_per_guest": MAX_UNPLAYED_PER_GUEST,
             "cooldown_seconds": REQUEST_COOLDOWN_SECONDS,
             "democratic_upvoting": True,
+            "max_song_duration_seconds": 7 * 60,
+            "block_duplicates": True,
+            "guest_quota": MAX_UNPLAYED_PER_GUEST,
         }
         self.history: deque = deque(maxlen=100)
+        self.current_video_id = None
+        self.skip_votes: set[str] = set()
         self.lock = threading.RLock()
 
     # -- rule helpers -----------------------------------------------------
@@ -117,7 +142,12 @@ class PartyRoom:
     def public_state(self) -> dict:
         ordered = sorted(
             self.tracks.values(),
-            key=lambda t: (t.status != "pending", -len(t.votes), t.created_at),
+            key=lambda t: (
+                t.status != "pending",
+                not t.priority,
+                -len(t.votes) if self.settings.get("democratic_upvoting") else 0,
+                t.created_at,
+            ),
         )
         pending = [t.to_dict() for t in ordered if t.status == "pending"]
         queued = [t.to_dict() for t in ordered if t.status == "queued"]
@@ -129,7 +159,25 @@ class PartyRoom:
             "pending": pending,
             "queue": queued,
             "history": list(self.history),
+            "active_track": self._active_track(),
+            "skip_votes": len(self.skip_votes),
+            "skip_threshold": self.skip_threshold(),
+            "skip_requested": self.skip_requested(),
         }
+    def _active_track(self) -> dict | None:
+        if not self.current_video_id:
+            return None
+        entry = PartyStore._find(self, self.current_video_id)
+        return entry.to_dict() if entry else {"videoId": self.current_video_id}
+
+    def connected_guest_count(self) -> int:
+        return sum(1 for guest in self.guests.values() if (_now() - guest.last_seen) < 30)
+
+    def skip_threshold(self) -> int:
+        return max(1, (self.connected_guest_count() + 1) // 2)
+
+    def skip_requested(self) -> bool:
+        return bool(self.current_video_id and len(self.skip_votes) >= self.skip_threshold())
 
 
 class PartyStore:
@@ -151,9 +199,10 @@ class PartyStore:
 
     def get_room(self, code: str) -> PartyRoom | None:
         with self._lock:
-            room = self._rooms.get((code or "").upper())
+            normalized = (code or "").upper()
+            room = self._rooms.get(normalized)
             if room and (_now() - room.created_at) > ROOM_LIFETIME_SECONDS:
-                del self._rooms[code]
+                del self._rooms[normalized]
                 return None
             return room
 
@@ -175,6 +224,35 @@ class PartyStore:
             guest = PartyGuest(secrets.token_hex(8), name)
             room.guests[guest.id] = guest
             return guest
+
+    @staticmethod
+    def update_settings(room: PartyRoom, updates: dict) -> None:
+        """Apply the host's bounded setup/settings values in one place."""
+        with room.lock:
+            if "require_approval" in updates:
+                room.settings["require_approval"] = bool(updates["require_approval"])
+            if "democratic_upvoting" in updates:
+                room.settings["democratic_upvoting"] = bool(updates["democratic_upvoting"])
+            if "block_duplicates" in updates:
+                room.settings["block_duplicates"] = bool(updates["block_duplicates"])
+            if "max_song_duration_seconds" in updates:
+                try:
+                    room.settings["max_song_duration_seconds"] = max(120, min(1200, int(updates["max_song_duration_seconds"])))
+                except (TypeError, ValueError):
+                    pass
+            if "guest_quota" in updates or "max_unplayed_per_guest" in updates:
+                try:
+                    quota = updates.get("guest_quota", updates.get("max_unplayed_per_guest"))
+                    quota = max(1, min(10, int(quota)))
+                    room.settings["guest_quota"] = quota
+                    room.settings["max_unplayed_per_guest"] = quota
+                except (TypeError, ValueError):
+                    pass
+            if "cooldown_seconds" in updates:
+                try:
+                    room.settings["cooldown_seconds"] = max(0, min(120, int(updates["cooldown_seconds"])))
+                except (TypeError, ValueError):
+                    pass
 
     @staticmethod
     def set_role(room: PartyRoom, guest_id: str, role: str) -> bool:
@@ -216,28 +294,43 @@ class PartyStore:
             if not video_id:
                 return None, "Track has no id"
             key = video_id
-            if key in room.tracks and room.tracks[key].status in ("pending", "queued"):
+            existing = [item for item in room.tracks.values() if item.video_id == video_id and item.status in ("pending", "queued", "playing")]
+            if room.settings.get("block_duplicates", True) and existing:
                 return None, "Already requested"
 
-            quota = room.settings["max_unplayed_per_guest"]
+            quota = room.settings.get("guest_quota", room.settings["max_unplayed_per_guest"])
             if quota and room.unplayed_count(guest.id) >= quota:
                 return None, f"Track limit reached ({quota} unplayed)"
 
-            entry = PartyTrack({**track, "videoId": video_id}, guest)
+            duration = _duration_seconds(track.get("duration"))
+            max_duration = room.settings.get("max_song_duration_seconds", 0)
+            play_next = bool(track.get("play_next"))
+            approval_reason = None
+            if max_duration and duration > max_duration:
+                approval_reason = "over_duration"
+            if play_next:
+                approval_reason = "play_next"
+            entry = PartyTrack({**track, "videoId": video_id, "play_next": play_next, "approval_reason": approval_reason}, guest)
             guest.last_request_at = _now()
-            room.tracks[key] = entry
+            storage_key = key if key not in room.tracks else f"{key}:{int(_now() * 1000)}"
+            room.tracks[storage_key] = entry
 
-            if room.settings["require_approval"]:
+            if room.settings["require_approval"] or approval_reason:
                 entry.status = "pending"
                 return entry.to_dict(), None  # host approval flow; no command yet
             entry.status = "queued"
             return entry.to_dict(), None
 
     @staticmethod
+    def _find(room: PartyRoom, video_id: str, status: str | None = None) -> PartyTrack | None:
+        matches = [item for item in room.tracks.values() if item.video_id == video_id and (status is None or item.status == status)]
+        return max(matches, key=lambda item: item.created_at, default=None)
+
+    @staticmethod
     def approve(room: PartyRoom, video_id: str) -> dict | None:
         with room.lock:
-            entry = room.tracks.get(video_id)
-            if not entry or entry.status != "pending":
+            entry = PartyStore._find(room, video_id, "pending")
+            if not entry:
                 return None
             entry.status = "queued"
             return entry.to_dict()
@@ -245,8 +338,8 @@ class PartyStore:
     @staticmethod
     def reject(room: PartyRoom, video_id: str) -> bool:
         with room.lock:
-            entry = room.tracks.get(video_id)
-            if not entry or entry.status != "pending":
+            entry = PartyStore._find(room, video_id, "pending")
+            if not entry:
                 return False
             entry.status = "rejected"
             return True
@@ -259,8 +352,8 @@ class PartyStore:
         if "vote" not in permissions and not (room.settings.get("democratic_upvoting") and "request" in permissions):
             return None
         with room.lock:
-            entry = room.tracks.get(video_id)
-            if not entry or entry.status != "queued":
+            entry = PartyStore._find(room, video_id, "queued")
+            if not entry:
                 return None
             if guest.id in entry.votes:
                 entry.votes.discard(guest.id)
@@ -271,10 +364,24 @@ class PartyStore:
     @staticmethod
     def mark_played(room: PartyRoom, video_id: str) -> None:
         with room.lock:
-            entry = room.tracks.get(video_id)
-            if entry and entry.status == "queued":
-                entry.status = "played"
-                room.history.append(entry.to_dict())
+            entry = PartyStore._find(room, video_id, "queued") or PartyStore._find(room, video_id, "played")
+            if entry:
+                if entry.status == "queued":
+                    entry.status = "played"
+                    room.history.append(entry.to_dict())
+                room.current_video_id = video_id
+                room.skip_votes.clear()
+
+    @staticmethod
+    def vote_skip(room: PartyRoom, guest: PartyGuest) -> tuple[int, int, bool] | None:
+        with room.lock:
+            if "request" not in room.permissions_for(guest) or not room.current_video_id:
+                return None
+            if guest.id in room.skip_votes:
+                room.skip_votes.remove(guest.id)
+            else:
+                room.skip_votes.add(guest.id)
+            return len(room.skip_votes), room.skip_threshold(), room.skip_requested()
 
 
 PARTY_STORE = PartyStore()
