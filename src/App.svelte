@@ -923,8 +923,22 @@
     }
     try {
       const response = await apiFetch(`/api/stream/${encodeURIComponent(streamTrackId)}?quality=${get(settings).quality}`, { signal: abortController.signal })
-      const data = await response.json()
       if (requestId !== playbackRequest) return
+      const status = response.status
+      let data = null
+      try { data = await response.json() } catch { data = null }
+      if (requestId !== playbackRequest) return
+      // Backend rate-limits stream resolution (8 per 20s). Auto-advancing here
+      // would cascade-skip the whole queue while the window is shut, so surface
+      // it and keep the track selected for a manual retry instead.
+      if (data?.error && status === 429) {
+        const retry = data.retry_after ? ` — try again in ${Math.ceil(Number(data.retry_after) || 0)}s` : ''
+        throw Object.assign(Error(`Stream rate-limited${retry}`), { transient: true })
+      }
+      // Non-JSON body: the proxy/backend returned an HTML error page (5xx). That
+      // is a transient backend condition, not a refusal of this track — advancing
+      // would only cascade through the queue on a dead proxy.
+      if (!data) throw Object.assign(Error(`Stream unavailable (HTTP ${status})`), { transient: true })
       if (!response.ok || data.error) { console.error("Stream resolution failed:", data.error); throw Error(data.error || 'Could not resolve audio stream.') }
       // Hard mismatch guard: a plain YouTube track must come back with its own
       // video id. Canonical/remote routing legitimately resolves to a different
@@ -942,8 +956,11 @@
       if (requestId !== playbackRequest) return
       console.error('playTrack failed:', error)
       isPlaying = false
-      showToast('Track unavailable')
-      if (activeQueue.upNext.length) selectNext()
+      // Rate limits and dead proxies are transient: never auto-advance through
+      // them, or a single skip could silently drain the entire queue. Only
+      // definite refusals (resolver errors, format failures, mismatches) skip.
+      if (!error?.transient && activeQueue.upNext.length) selectNext()
+      showToast(error?.transient ? error.message : 'Track unavailable')
     } finally {
       if (requestId === playbackRequest) loadingTrack = false
     }
