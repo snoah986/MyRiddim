@@ -60,6 +60,11 @@
   </style>
 </head>
 <body>
+  <div id="connection-error" style="display:none; padding:24px; text-align:center; color:#fff; font-family:sans-serif;">
+    <h2>Unable to connect to host</h2>
+    <p style="color:#aaa; font-size:14px;">If you are on campus/university Wi-Fi, connect both devices to a mobile hotspot to bypass network client isolation.</p>
+    <button onclick="location.reload()" style="margin-top:16px; padding:10px 20px; border-radius:20px; background:#fff; color:#000; border:none; font-weight:bold;">Retry</button>
+  </div>
   <div class="app">
     <header class="topbar"><div class="brand">myriddim</div><div id="connection" class="connection"><i></i><span>Connecting…</span></div><div class="top-actions"><button class="icon" id="lyrics-btn" aria-label="Open lyrics">♫</button><button class="icon" id="queue-btn" aria-label="Open queue">☷</button></div></header>
     <main class="main"><div id="art-wrap" class="art-wrap empty">♫</div><div class="meta"><h1 id="title">No track playing</h1><p id="artist">Connect your desktop player</p><small id="album"></small></div></main>
@@ -71,11 +76,13 @@
   <script>
     let base = localStorage.getItem('myriddim.remoteBase') || `${location.protocol}//${location.host}`;
     let state = { current_track:null, is_playing:false, current_time:0, duration:0, volume:1, queue:[], lyrics:[] };
-    let activeDrawer = null, pollTimer, toastTimer, lyricsFor = null, lyricsLoading = false, lyricsRequest = 0, searchRequest = 0, syncRequest = 0, commandChain = Promise.resolve(), seekTimer, pendingSeek = null, isSeeking = false;
+    let activeDrawer = null, pollTimer, toastTimer, lyricsFor = null, lyricsLoading = false, lyricsRequest = 0, searchRequest = 0, syncRequest = 0, commandChain = Promise.resolve(), seekTimer, pendingSeek = null, isSeeking = false, booted = false;
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
     const time = (value) => { const n=Number(value); if (!Number.isFinite(n)) return '0:00'; return `${Math.floor(n/60)}:${String(Math.floor(n%60)).padStart(2,'0')}`; };
     function showToast(message) { $('toast').textContent=message; $('toast').hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('toast').hidden=true,2600); }
+    function showConnectionError() { const box=document.getElementById('connection-error'); if (box) box.style.display='block'; const badge=$('connection'); if (badge) badge.classList.remove('online'); }
+    function hideConnectionError() { const box=document.getElementById('connection-error'); if (box) box.style.display='none'; }
     async function request(path, options) { const response=await fetch(`${base}${path}`,options); if (!response.ok) throw Error(`Request failed (${response.status})`); return response.json(); }
     function render() {
       const track=state.current_track || {}; const art=$('art-wrap');
@@ -93,10 +100,11 @@
       try {
         const data=await request('/api/remote/state');
         if(requestId!==syncRequest) return;
-        state={...state,...data}; render();
+        state={...state,...data}; booted = true; hideConnectionError(); render();
       } catch {
         if(requestId!==syncRequest) return;
         $('connection').classList.remove('online'); $('connection').querySelector('span').textContent='Offline';
+        if (!booted) showConnectionError();
       }
     }
     function send(action,payload=null,refresh=true) {
@@ -169,9 +177,17 @@
         } catch { if(searchId===searchRequest && activeDrawer==='search') $('search-results').innerHTML='<div class="empty">Search unavailable.</div>'; }
       });
     }
-    $('play').onclick=()=>send('toggle_play'); $('previous').onclick=()=>send('previous'); $('next').onclick=()=>send('next'); $('shuffle').onclick=()=>send('toggle_shuffle'); $('repeat').onclick=()=>send('toggle_repeat'); $('party-skip').onclick=voteSkip; $('lyrics-btn').onclick=()=>openDrawer('lyrics'); $('queue-btn').onclick=()=>openDrawer('queue'); $('drawer-close').onclick=()=>openDrawer(null); $('seek').onpointerdown=beginSeek; $('seek').ontouchstart=beginSeek; $('seek').oninput=()=>scheduleSeek($('seek').value); $('seek').onpointerup=endSeek; $('seek').ontouchend=endSeek; $('seek').onchange=endSeek; $('volume').oninput=()=>send('set_volume',Number($('volume').value)); document.querySelectorAll('[data-tab]').forEach((button)=>button.onclick=()=>button.dataset.tab==='search'?openDrawer('search'):button.dataset.tab==='party'?openDrawer('party'):openDrawer(null));
-    sync(); pollTimer=setInterval(sync,1000); window.addEventListener('pagehide',()=>{ clearInterval(pollTimer); clearInterval(partyTimer); clearTimeout(seekTimer); clearTimeout(toastTimer); });
-    if ('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('/mobile-sw.js',{scope:'/mobile'}).catch(()=>{}));
+    // Wire the UI and start the poll loop. Any initialization exception, a
+    // failed first fetch, or a 4-second silent timeout surfaces the visible
+    // fallback instead of leaving a blank page.
+    try {
+      $('play').onclick=()=>send('toggle_play'); $('previous').onclick=()=>send('previous'); $('next').onclick=()=>send('next'); $('shuffle').onclick=()=>send('toggle_shuffle'); $('repeat').onclick=()=>send('toggle_repeat'); $('party-skip').onclick=voteSkip; $('lyrics-btn').onclick=()=>openDrawer('lyrics'); $('queue-btn').onclick=()=>openDrawer('queue'); $('drawer-close').onclick=()=>openDrawer(null); $('seek').onpointerdown=beginSeek; $('seek').ontouchstart=beginSeek; $('seek').oninput=()=>scheduleSeek($('seek').value); $('seek').onpointerup=endSeek; $('seek').ontouchend=endSeek; $('seek').onchange=endSeek; $('volume').oninput=()=>send('set_volume',Number($('volume').value)); document.querySelectorAll('[data-tab]').forEach((button)=>button.onclick=()=>button.dataset.tab==='search'?openDrawer('search'):button.dataset.tab==='party'?openDrawer('party'):openDrawer(null));
+      sync(); pollTimer=setInterval(sync,1000); window.addEventListener('pagehide',()=>{ clearInterval(pollTimer); clearInterval(partyTimer); clearTimeout(seekTimer); clearTimeout(toastTimer); });
+      if ('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('/mobile-sw.js',{scope:'/mobile'}).catch(()=>{}));
+      // If the host never answers within 4 seconds, surface the fallback;
+      // later successful syncs hide it again.
+      setTimeout(() => { if (!booted) showConnectionError(); }, 4000);
+    } catch (error) { showConnectionError(); }
 
     // --- Party Mode (guest) ----------------------------------------------
     // Same host API, guest role: join by room code, request tracks from the
@@ -301,17 +317,19 @@
       };
       document.getElementById('join-name').focus();
     }
-    (function initParty() {
-      const fromLink = partyParams();
-      const saved = (() => { try { return JSON.parse(localStorage.getItem('myriddim.partyGuest')||'null'); } catch { return null; } })();
-      if (fromLink) { openPartyJoin(fromLink); }
-      else if (saved && saved.code && saved.id) {
-        partyGuest = saved;
-        party = { active: true, code: saved.code };
-        enterPartyMode();
-        partySync();
-      }
-    })();
+    try {
+      (function initParty() {
+        const fromLink = partyParams();
+        const saved = (() => { try { return JSON.parse(localStorage.getItem('myriddim.partyGuest')||'null'); } catch { return null; } })();
+        if (fromLink) { openPartyJoin(fromLink); }
+        else if (saved && saved.code && saved.id) {
+          partyGuest = saved;
+          party = { active: true, code: saved.code };
+          enterPartyMode();
+          partySync();
+        }
+      })();
+    } catch (error) { showConnectionError(); }
   </script>
 </body>
 </html>

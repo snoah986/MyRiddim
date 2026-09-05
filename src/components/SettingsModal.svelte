@@ -20,6 +20,13 @@
   let limitSaved = false
   let authUploading = false
   let accountName = ''
+  let updateSupported = false
+  let updateChecking = false
+  let updateAvailable = null
+  let updateError = ''
+  let updateInstalling = false
+  let updateProgress = 0
+  let updateContentLength = 0
 
   const formatBytes = bytes => {
     if (!Number.isFinite(bytes)) return '0 B'
@@ -50,8 +57,55 @@
       const healthData = await healthRes.json()
       backendOk = healthRes.ok && ['ok', 'expired'].includes(healthData.status)
       backendSession = healthData.session || healthData.status
-    } catch { backendOk = false }
+      updateSupported = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+      if (updateSupported) checkForUpdates({ silent: true })
+    } catch {
+      backendOk = false
+      updateSupported = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+      if (updateSupported) checkForUpdates({ silent: true })
+    }
   })
+
+  async function checkForUpdates({ silent = false } = {}) {
+    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
+      if (!silent) updateError = 'Updates are available in the packaged desktop app.'
+      return
+    }
+    updateSupported = true
+    updateChecking = true
+    updateError = ''
+    try {
+      const { check } = await import('@tauri-apps/plugin-updater')
+      updateAvailable = await check()
+      if (!updateAvailable && !silent) onToast('You are up to date')
+    } catch (error) {
+      updateAvailable = null
+      updateError = error?.message || 'Could not check for updates.'
+      if (!silent) onToast('Could not check for updates')
+    } finally {
+      updateChecking = false
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateAvailable || updateInstalling) return
+    updateInstalling = true
+    updateProgress = 0
+    updateContentLength = 0
+    try {
+      await updateAvailable.downloadAndInstall(event => {
+        if (event.event === 'Started') updateContentLength = event.data.contentLength || 0
+        if (event.event === 'Progress' && updateContentLength) updateProgress = Math.min(100, (updateProgress + (event.data.chunkLength / updateContentLength) * 100))
+        if (event.event === 'Finished') updateProgress = 100
+      })
+      const { relaunch } = await import('@tauri-apps/plugin-process')
+      await relaunch()
+    } catch (error) {
+      updateError = error?.message || 'Could not install the update.'
+      onToast('Could not install update')
+      updateInstalling = false
+    }
+  }
 
   async function saveCacheLimit() {
     const mb = Number($settings.cacheLimitMb)
@@ -234,6 +288,20 @@
         </div>
       </section>
 
+      <!-- Software Updates -->
+      <section class="group">
+        <h3 class="group-title">Software Updates</h3>
+        <div class="row">
+          <div class="row-label"><strong>Freebuff Desktop</strong><small>{#if updateAvailable}Version {updateAvailable.version} is ready to install.{:else if updateError}{updateError}{:else if updateSupported}Checks signed GitHub Releases in the background.{:else}Install the packaged desktop app to receive signed updates.{/if}</small></div>
+          {#if updateAvailable}
+            <button class="ghost" on:click={installUpdate} disabled={updateInstalling}>{updateInstalling ? (updateProgress ? `Installing ${Math.round(updateProgress)}%` : 'Installing…') : 'Install update'}</button>
+          {:else}
+            <button class="ghost" on:click={() => checkForUpdates()} disabled={updateChecking}>{updateChecking ? 'Checking…' : 'Check for updates'}</button>
+          {/if}
+        </div>
+        {#if updateInstalling && updateContentLength}<div class="update-progress" aria-label="Update download progress"><i style={`width: ${updateProgress}%`}></i></div>{/if}
+      </section>
+
       <!-- Advanced Diagnostics -->
       <section class="group">
         <h3 class="group-title">Advanced Diagnostics</h3>
@@ -308,6 +376,8 @@
   .badge.down { color: #fca5a5; background: #fca5a514; }
   .badge.down i { background: #f87171; box-shadow: 0 0 8px #f87171; }
   .version { padding: 4px 10px; border: 1px solid #ffffff14; border-radius: 8px; color: #a1a1aa; font-size: .72rem; font-family: ui-monospace, monospace; flex: 0 0 auto; }
+  .update-progress { height: 5px; margin: 0 4px 4px; overflow: hidden; border-radius: 999px; background: #ffffff10; }
+  .update-progress i { display: block; height: 100%; border-radius: inherit; background: var(--accent, #c4b5fd); transition: width .2s ease; }
   @media (max-width: 560px) {
     .sheet { max-height: 92vh; border-radius: 16px; }
     .row { flex-wrap: wrap; }

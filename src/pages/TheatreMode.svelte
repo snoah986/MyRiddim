@@ -4,7 +4,7 @@
   import { audio, getActiveAudio } from '../lib/audio.js'
   import { settings } from '../lib/settings.js'
   import { buildCadenceLines } from '../lib/cadence_engine.js'
-  import { applyKaraokeOffset, applyVideoOffset, cleanTrackMeta } from '../lib/lyrics.js'
+  import { cleanTrackMeta } from '../lib/lyrics.js'
   import KaraokeLyrics from '../components/KaraokeLyrics.svelte'
 
   export let track
@@ -20,6 +20,7 @@
   export let playlists = []
   export let onSaveToPlaylist = async () => null
   export let onCreatePlaylist = async () => null
+  export let onSaveQueueAsPlaylist = async () => null
   export let onFavorite = () => {}
   export let onClearManualQueue = () => {}
   export let onToggle = () => {}
@@ -37,6 +38,7 @@
   export let onAddToQueue = () => {}
   export let onRemoveUpcoming = () => {}
   export let onReorder = () => {}
+  export let onClose = () => {}
 
   // --- Party Mode (host) -------------------------------------------------
   export let party = null // { code, guests, pending, settings } | null
@@ -69,6 +71,16 @@
   let newPlaylistName = ''
   let saveBusy = false
   let saveToastTimer
+  let playlistPickerOpen = false
+  let playlistPickerQuery = ''
+  let playlistCreateOpen = false
+  let playlistCreateName = ''
+  let playlistMembership = {}
+  let playlistAdding = {}
+  let playlistPickerRequest = 0
+  let queueSaveOpen = false
+  let queueSaveName = ''
+  let queueSaveBusy = false
   let flushTimer
   let flushProgress = 0
   let partyHostName = 'Host'
@@ -135,6 +147,78 @@
     }
   }
 
+  $: editablePlaylists = (playlists || []).filter(item => item?.owned)
+  $: filteredPlaylists = editablePlaylists.filter(item => !playlistPickerQuery.trim() || clean(item.title).toLowerCase().includes(playlistPickerQuery.trim().toLowerCase()))
+  $: queueTracks = [track, ...(upNext || [])].filter(item => item?.videoId).filter((item, index, items) => items.findIndex(candidate => candidate.videoId === item.videoId) === index)
+  $: defaultQueueSaveName = `Queue (${new Date().toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' })})`
+
+  async function openPlaylistPicker() {
+    if (!track?.videoId) return
+    playlistPickerOpen = true
+    playlistPickerQuery = ''
+    playlistCreateOpen = false
+    playlistCreateName = ''
+    playlistMembership = {}
+    const request = ++playlistPickerRequest
+    try {
+      const response = await apiFetch(`/api/playlist/membership?video_id=${encodeURIComponent(track.videoId)}`)
+      const data = await response.json().catch(() => ({}))
+      if (request === playlistPickerRequest && response.ok && data.membership) playlistMembership = data.membership
+    } catch { /* membership is advisory; adding remains available */ }
+  }
+
+  function closePlaylistPicker() {
+    playlistPickerOpen = false
+    playlistCreateOpen = false
+    playlistPickerQuery = ''
+    playlistPickerRequest += 1
+  }
+
+  async function addCurrentTrackToPlaylist(playlist) {
+    if (!track?.videoId || !playlist?.id || playlistAdding[playlist.id]) return
+    playlistAdding = { ...playlistAdding, [playlist.id]: true }
+    const target = await onSaveToPlaylist(track, playlist.id)
+    if (target) {
+      playlistMembership = { ...playlistMembership, [playlist.id]: true }
+      setTimeout(closePlaylistPicker, 400)
+    } else {
+      const next = { ...playlistAdding }
+      delete next[playlist.id]
+      playlistAdding = next
+    }
+  }
+
+  async function createAndAddCurrentTrack() {
+    const name = playlistCreateName.trim()
+    if (!name || !track?.videoId) return
+    playlistAdding = { ...playlistAdding, __new: true }
+    const created = await onCreatePlaylist(name)
+    if (created) {
+      const target = await onSaveToPlaylist(track, created.id)
+      if (target) setTimeout(closePlaylistPicker, 400)
+    }
+    const next = { ...playlistAdding }
+    delete next.__new
+    playlistAdding = next
+    if (created) playlistCreateName = ''
+  }
+
+  function openQueueSave() {
+    if (!queueTracks.length) return
+    queueSaveName = defaultQueueSaveName
+    queueSaveOpen = true
+  }
+
+  async function saveQueueAsPlaylist() {
+    const name = queueSaveName.trim()
+    if (!name || !queueTracks.length || queueSaveBusy) return
+    queueSaveBusy = true
+    try {
+      const result = await onSaveQueueAsPlaylist(name, queueTracks)
+      if (result) queueSaveOpen = false
+    } finally { queueSaveBusy = false }
+  }
+
   let videoUrl = null
   let videoLoading = false
   let videoErrorMessage = ''
@@ -166,6 +250,8 @@
   let karaokeLoading = false
   let karaokeRequest = 0
   let videoOffsetRequest = 0
+  let videoEntryAudioTime = 0
+  let videoHandoffPending = false
   let syncToast = ''
   let syncToastTimer
   const ANTICIPATION_LEAD = 0.18
@@ -371,7 +457,9 @@
       return
     }
     if (event.key === 'Escape') {
-      if (partySetupOpen) onPartyOpen()
+      if (playlistPickerOpen) closePlaylistPicker()
+      else if (queueSaveOpen) queueSaveOpen = false
+      else if (partySetupOpen) onPartyOpen()
       else if (partyEndConfirmOpen) partyEndConfirmOpen = false
       else if (queueOpen) onQueue()
       else if (isVideoMode) exitVideoMode(true)
@@ -408,7 +496,11 @@
   function videoMetadataLoaded() {
     if (!videoElement || !isVideoMode) return
     videoDuration = Number.isFinite(videoElement.duration) ? videoElement.duration : 0
-    videoElement.currentTime = Math.min(currentPlaybackTime, videoDuration || currentPlaybackTime)
+    // Hand-off: the companion video must land where the same studio content
+    // plays (AudioTime + introOffset), never at the raw audio position.
+    const target = Math.max(0, videoEntryAudioTime + (videoOffset || 0))
+    videoElement.currentTime = Math.min(target, videoDuration || target)
+    if ((videoOffset || 0) > 0) videoHandoffPending = false
     videoElement.play().then(() => { videoPlaying = true }).catch(videoPlaybackError)
   }
 
@@ -436,6 +528,7 @@
   function handleSeek(event) {
     const value = Number(event.currentTarget.value)
     if (!Number.isFinite(value)) return
+    videoHandoffPending = false
     if (isVideoMode && videoElement) {
       currentPlaybackTime = value
       videoElement.currentTime = value
@@ -451,6 +544,8 @@
     }
     if (!hasVideo || !companionVideoId) return
     currentPlaybackTime = Number.isFinite(currentTime) ? currentTime : 0
+    videoEntryAudioTime = currentPlaybackTime
+    videoHandoffPending = true
     videoPlaying = false
     videoModeTrackId = companionVideoId
     videoPausedAudio = isPlaying
@@ -462,6 +557,8 @@
   async function exitVideoMode(resumeAudio = true) {
     if (!isVideoMode) return
     currentPlaybackTime = videoElement?.currentTime ?? currentPlaybackTime
+    // Hand-off back: the audio deck resumes at AudioTime = VideoTime - introOffset.
+    const audioTarget = Math.max(0, currentPlaybackTime - (videoOffset || 0))
     videoElement?.pause()
     videoPlaying = false
     const shouldResume = resumeAudio && videoPausedAudio
@@ -474,10 +571,10 @@
     videoOffset = 0
     videoOffsetSource = 'none'
     videoNeedsSync = false
-    lyrics = rawLyrics
-    karaokeLines = rawKaraokeLines
+    videoHandoffPending = false
+    refreshLyricDisplays()
     videoPausedAudio = false
-    onSeek({ currentTarget: { value: currentPlaybackTime } })
+    onSeek({ currentTarget: { value: audioTarget } })
     if (shouldResume) {
       await tick()
       onToggle()
@@ -535,11 +632,11 @@
       if (request !== karaokeRequest) return
       rawKaraokeLines = (data.lines || []).filter(line => line && Number.isFinite(Number(line.start)) && line.text)
       if (!rawKaraokeLines.length && rawLyrics.length) rawKaraokeLines = buildCadenceLines(rawLyrics, duration)
-      karaokeLines = isVideoMode ? applyKaraokeOffset(rawKaraokeLines, videoOffset, videoNeedsSync) : rawKaraokeLines
+      refreshLyricDisplays()
     } catch {
       if (request === karaokeRequest && rawLyrics.length) {
         rawKaraokeLines = buildCadenceLines(rawLyrics, duration)
-        karaokeLines = isVideoMode ? applyKaraokeOffset(rawKaraokeLines, videoOffset, videoNeedsSync) : rawKaraokeLines
+        refreshLyricDisplays()
       }
       // Syllable precision is optional; regular LRCLIB/YTM lyrics remain available.
     } finally {
@@ -562,12 +659,11 @@
       if (request !== lyricRequest) return
       rawLyrics = (data.lines || []).filter(line => line && Number.isFinite(Number(line.time)) && line.text != null && line.text !== '')
       if (!rawKaraokeLines.length && rawLyrics.length) {
-        const fallback = buildCadenceLines(rawLyrics, duration)
-        karaokeLines = isVideoMode ? applyKaraokeOffset(fallback, videoOffset, videoNeedsSync) : fallback
+        rawKaraokeLines = buildCadenceLines(rawLyrics, duration)
       }
-      lyrics = isVideoMode ? applyVideoOffset(rawLyrics, videoOffset, videoNeedsSync) : rawLyrics
-      lyricsSynced = data.synced === true && lyrics.length > 0
-      plainLyrics = lyrics.length ? '' : (data.text || '')
+      refreshLyricDisplays()
+      lyricsSynced = data.synced === true && rawLyrics.length > 0
+      plainLyrics = rawLyrics.length ? '' : (data.text || '')
       syncLyricsOnce()
     } catch {
       // Lyrics are optional and must never interrupt playback.
@@ -584,8 +680,45 @@
     return isVideoMode ? (videoElement?.currentTime ?? currentPlaybackTime) : (getActiveAudio()?.currentTime ?? audio.currentTime)
   }
 
+  // Lyric timestamps (LRC and YRC) are permanently referenced to the studio
+  // audio recording where music start = 0.0s.  introOffset is the number of
+  // seconds of intro/cinematics in the companion music video before the studio
+  // song begins, so AudioTime = VideoTime - introOffset.  lyricClock() returns
+  // the audio-referenced position at any instant so lyric rendering never
+  // consumes raw video time directly.
+  function lyricClock() {
+    const now = isVideoMode ? (videoElement?.currentTime ?? currentPlaybackTime) : (getActiveAudio()?.currentTime ?? audio.currentTime)
+    return isVideoMode ? Math.max(0, now - (videoOffset || 0)) : now
+  }
+
+  // The displayed lyric lists are the pristine studio-referenced lines plus
+  // (video mode only) a cinematic-intro or tap-to-sync marker card at 0.0s.
+  // Lines are never re-timestamped; the clock shift in lyricClock() aligns
+  // them to the video timeline.
+  function refreshLyricDisplays() {
+    if (!isVideoMode) {
+      lyrics = rawLyrics
+      karaokeLines = rawKaraokeLines
+      return
+    }
+    if (videoNeedsSync) {
+      lyrics = rawLyrics.length ? [{ time: 0, text: '♪ [Intro in progress — Tap to sync beat] ♪', isPrompt: true }, ...rawLyrics] : rawLyrics
+      karaokeLines = rawKaraokeLines.length ? [{ start: 0, end: 0.5, text: '♪ [Intro in progress — Tap to sync beat] ♪', words: [], isPrompt: true }, ...rawKaraokeLines] : rawKaraokeLines
+      return
+    }
+    if (videoOffset > 0) {
+      lyrics = rawLyrics.length ? [{ time: 0, text: '♪ [Cinematic Intro] ♪', isIntro: true, duration: videoOffset }, ...rawLyrics] : rawLyrics
+      // end is a marker-sized window: lyricClock() is clamped at 0 during the
+      // intro, so the card stays highlighted only while VideoTime < introOffset.
+      karaokeLines = rawKaraokeLines.length ? [{ start: 0, end: 0.001, text: '♪ [Cinematic Intro] ♪', words: [], isIntro: true }, ...rawKaraokeLines] : rawKaraokeLines
+      return
+    }
+    lyrics = rawLyrics
+    karaokeLines = rawKaraokeLines
+  }
+
   function computeActiveLyric() {
-    const effectiveTime = mediaTime() + ANTICIPATION_LEAD + manualOffset
+    const effectiveTime = lyricClock() + ANTICIPATION_LEAD + manualOffset
     return lyrics.reduce((found, line, index) => line.time <= effectiveTime ? index : found, -1)
   }
 
@@ -643,8 +776,14 @@
       videoOffset = Math.max(-VIDEO_OFFSET_MAX, Math.min(VIDEO_OFFSET_MAX, Number(data.intro_offset) || 0))
       videoOffsetSource = data.source || 'none'
       videoNeedsSync = videoOffsetSource === 'needs_sync' || videoOffsetSource === 'delta_estimate'
-      if (rawLyrics.length) { lyrics = applyVideoOffset(rawLyrics, videoOffset, videoNeedsSync); syncLyricsOnce() }
-      if (rawKaraokeLines.length) karaokeLines = applyKaraokeOffset(rawKaraokeLines, videoOffset, videoNeedsSync)
+      refreshLyricDisplays()
+      // Late-arriving intro offset: align the already-mounted video to the
+      // studio position so content (not raw time) stays in sync.
+      if (videoHandoffPending && videoElement && isVideoMode) {
+        if (videoOffset > 0) videoElement.currentTime = Math.max(0, videoEntryAudioTime + videoOffset)
+        videoHandoffPending = false
+      }
+      syncLyricsOnce()
     } catch { /* offset resolution is optional */ }
   }
 
@@ -663,8 +802,7 @@
     videoOffset = Math.max(-VIDEO_OFFSET_MAX, Math.min(VIDEO_OFFSET_MAX, Number(offset) || 0))
     videoOffsetSource = source
     videoNeedsSync = false
-    lyrics = applyVideoOffset(rawLyrics, videoOffset, false)
-    if (rawKaraokeLines.length) karaokeLines = applyKaraokeOffset(rawKaraokeLines, videoOffset, false)
+    refreshLyricDisplays()
     try { apiFetch('/api/video-offset', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ video_id: id, intro_offset: videoOffset, source }) }).catch(() => {}) } catch { /* optional persistence */ }
     syncLyricsOnce()
   }
@@ -689,8 +827,11 @@
   function seekLine(time) {
     if (!Number.isFinite(time)) return
     if (isVideoMode && videoElement) {
-      currentPlaybackTime = time
-      videoElement.currentTime = time
+      // Lyric lines are studio-referenced; seek the video to AudioTime + introOffset.
+      const videoTarget = Math.max(0, time + (videoOffset || 0))
+      currentPlaybackTime = videoTarget
+      videoElement.currentTime = videoTarget
+      videoHandoffPending = false
     } else onSeek({ currentTarget: { value: time } })
     syncLyricsOnce()
   }
@@ -776,12 +917,12 @@
 
     <main class="theatre-main">
       {#if lyricsOpen}
-        {#if isVideoMode && videoUrl}
-          <div class="lyrics-video-backdrop" aria-hidden="true">
-            <video bind:this={videoElement} src={videoUrl} playsinline preload="auto" autoplay class="backdrop-video" on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:error={videoPlaybackError}><track kind="captions" /></video>
-            <div class="backdrop-shade"></div>
-          </div>
-        {/if}
+      {#if isVideoMode}
+        <div class="lyrics-video-backdrop" aria-hidden="true">
+          <video bind:this={videoElement} src={videoUrl} playsinline preload="auto" autoplay class="backdrop-video" on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:error={videoPlaybackError}><track kind="captions" /></video>
+          <div class="backdrop-shade"></div>
+        </div>
+      {/if}
         <section class="lyrics-stage" aria-label="Synchronized lyrics">
           <div class="lyrics-heading">
             <div class="lyrics-title"><span>{clean(track?.title) || 'Lyrics'}</span><span class="micro-badge">{statusLabel}</span></div>
@@ -793,7 +934,7 @@
           </div>
           {#if syncToast}<div class="sync-toast" role="status">{syncToast}</div>{/if}
           {#if karaokeLines.length}
-            <KaraokeLyrics lines={karaokeLines} media={isVideoMode ? videoElement : getActiveAudio()} currentTime={playbackTime} playing={isPlaying || videoPlaying} onSeek={seekLine} onSync={syncBeat} />
+            <KaraokeLyrics lines={karaokeLines} media={isVideoMode ? videoElement : getActiveAudio()} clock={lyricClock} currentTime={playbackTime} playing={isPlaying || videoPlaying} onSeek={seekLine} onSync={syncBeat} />
           {:else if lyrics.length}
             <div class="lyrics-scroll" bind:this={lyricsContainer}>
               {#each lyrics as line, index}
@@ -817,7 +958,7 @@
             <div class:video-frame={isVideoMode} class:tilt-reset={!tiltActive || isVideoMode} class="art-frame" style={tiltStyle}>
               {#if isVideoMode && companionVideoId}
                 <div class="native-video-shell">
-                  {#if videoUrl}<video bind:this={videoElement} class="native-video" src={videoUrl} playsinline preload="auto" autoplay on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:seeking={videoTimeUpdated} on:error={videoPlaybackError} on:ended={onNext} on:pointerdown|stopPropagation|preventDefault={togglePlayback} aria-label="Video for {clean(track?.title)}"><track kind="captions" /></video>{/if}
+                  <video bind:this={videoElement} class="native-video" src={videoUrl} playsinline preload="auto" autoplay on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:seeking={videoTimeUpdated} on:error={videoPlaybackError} on:ended={onNext} on:pointerdown|stopPropagation|preventDefault={togglePlayback} aria-label="Video for {clean(track?.title)}"><track kind="captions" /></video>
                   {#if videoLoading}<div class="video-message"><span></span>Resolving video stream…</div>{:else if videoErrorMessage}<div class="video-message error"><strong>Could not load video</strong><small>{videoErrorMessage}</small></div>{:else if !videoUrl}<div class="video-message error">Video unavailable for this track.</div>{/if}
                 </div>
                 <button class="video-exit" on:pointerdown|preventDefault={() => exitVideoMode(true)} aria-label="Return to album artwork"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg><span>Artwork</span></button>
@@ -865,6 +1006,7 @@
             <span>{party ? `${connectedGuests.length} connected` : 'Party'}</span>
             {#if pendingCount}<b class="party-pending">{pendingCount}</b>{/if}
           </button>
+          <button class="text-pill" on:pointerdown|preventDefault={openPlaylistPicker} aria-label="Add current track to a playlist" title="Add to Playlist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg><span>Add to Playlist</span></button>
           <button class:active={lyricsOpen} class="text-pill" on:pointerdown|preventDefault={toggleLyrics} aria-label="Toggle synced lyrics" title="Toggle synced lyrics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zm5 9a5 5 0 0 1-10 0M12 17v4M8 21h8" /></svg><span>Lyrics</span></button>
           <button class:active={queueOpen} class="text-pill" on:pointerdown|preventDefault={onQueue} aria-label="Toggle playback queue" title="Toggle playback queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg><span>Queue</span>{#if upNext.length}<b>{upNext.length}</b>{/if}</button>
         </div>
@@ -965,6 +1107,33 @@
     </div>
   {/if}
 
+  {#if playlistPickerOpen}
+    <div class="playlist-overlay" role="presentation" on:click|self={closePlaylistPicker}>
+      <section class="playlist-picker" role="dialog" tabindex="-1" aria-modal="true" aria-label="Add to Playlist">
+        <header class="playlist-picker-head"><div><span class="queue-kicker">LIBRARY</span><h2>Add to Playlist</h2><p>{clean(track?.title)} · {clean(track?.artist)}</p></div><button class="round-button" on:click={closePlaylistPicker} aria-label="Close Add to Playlist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button></header>
+        <label class="playlist-filter"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></svg><input bind:value={playlistPickerQuery} type="search" placeholder="Filter playlists..." aria-label="Filter playlists" /></label>
+        <div class="playlist-picker-list">
+          <button class="playlist-create-row" on:click={() => playlistCreateOpen = !playlistCreateOpen}><span class="playlist-create-icon">＋</span><span><strong>Create New Playlist</strong><small>Add this track to a fresh collection</small></span></button>
+          {#if playlistCreateOpen}<form class="inline-playlist-create" on:submit|preventDefault={createAndAddCurrentTrack}><input bind:value={playlistCreateName} autofocus placeholder="Playlist name" aria-label="New playlist name" /><button type="submit" disabled={!playlistCreateName.trim() || playlistAdding.__new}>{playlistAdding.__new ? 'Adding…' : 'Create & Add'}</button></form>{/if}
+          {#each filteredPlaylists as playlist (playlist.id)}
+            <button class="playlist-choice" class:playlist-added={playlistMembership[playlist.id]} disabled={playlistAdding[playlist.id]} on:click={() => addCurrentTrackToPlaylist(playlist)}><span class="playlist-choice-art">{#if playlist.thumbnail}<img src={playlist.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="playlist-choice-copy"><strong>{clean(playlist.title)}</strong><small>{playlist.count ?? 0} tracks</small></span><span class="playlist-choice-state">{#if playlistAdding[playlist.id]}Adding…{:else if playlistMembership[playlist.id]}✓ Added{:else}Add{/if}</span></button>
+          {/each}
+          {#if !filteredPlaylists.length}<p class="playlist-picker-empty">{editablePlaylists.length ? 'No playlists match your filter.' : 'Create a playlist to save this track.'}</p>{/if}
+        </div>
+      </section>
+    </div>
+  {/if}
+
+  {#if queueSaveOpen}
+    <div class="playlist-overlay" role="presentation" on:click|self={() => queueSaveOpen = false}>
+      <form class="playlist-picker queue-save-dialog" role="dialog" tabindex="-1" aria-modal="true" aria-label="Save Queue as Playlist" on:submit|preventDefault={saveQueueAsPlaylist}>
+        <header class="playlist-picker-head"><div><span class="queue-kicker">PLAYBACK MANAGER</span><h2>Save Queue as Playlist</h2><p>Saving {queueTracks.length} {queueTracks.length === 1 ? 'track' : 'tracks'} in order</p></div><button type="button" class="round-button" on:click={() => queueSaveOpen = false} aria-label="Close Save Queue dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button></header>
+        <label class="playlist-name-field"><span>Playlist name</span><input bind:value={queueSaveName} autofocus aria-label="Playlist name" /></label>
+        <button class="playlist-primary" type="submit" disabled={queueSaveBusy || !queueSaveName.trim()}>{queueSaveBusy ? 'Creating…' : 'Create Playlist'}</button>
+      </form>
+    </div>
+  {/if}
+
   {#if queueOpen}
     <div class="queue-overlay" role="presentation" on:click|self={onQueue}>
       <div class="queue-drawer" role="dialog" tabindex="-1" aria-modal="true" aria-label="Up next and recommendations">
@@ -974,6 +1143,7 @@
             <button role="tab" aria-selected={queueTab === 'recommended'} class:active={queueTab === 'recommended'} on:click={openRecTab}>Recommended</button>
           </div>
           <div class="queue-actions">
+            <button class="queue-save-all" disabled={!queueTracks.length} on:click={openQueueSave} aria-label="Save queue as playlist" title="Save Queue as Playlist">Save Queue</button>
             <button class="flush-button" disabled={!upNext.some(item => item?.queueSource === 'manual')} on:pointerdown={requestFlush} on:pointerup={stopFlush} on:pointerleave={stopFlush} on:pointercancel={stopFlush} aria-label={$settings.instantQueueFlush ? 'Clear manually queued tracks' : 'Hold to clear manually queued tracks'} title={$settings.instantQueueFlush ? 'Clear manual queue' : 'Hold 0.8 seconds to clear manual queue'}>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v6m4-6v6" /></svg>{#if flushProgress > 0}<span class="flush-ring" style={`--progress:${flushProgress}`}></span>{/if}
             </button>
@@ -1042,6 +1212,13 @@
   .theatre.queue-visible .theatre-main { transform:translateX(-12%) scale(.92); transition:transform .3s ease-out; transform-origin:center center; }
   .queue-overlay { position:fixed; inset:0; z-index:50; background:#0006; backdrop-filter:blur(3px); animation:overlay-in .25s ease; }
   .queue-drawer { position:absolute; top:0; right:0; display:flex; flex-direction:column; width:min(390px,92vw); height:100%; padding:1.25rem 1rem 1rem; border-left:1px solid #ffffff14; color:#fff; background:#09090be0; box-shadow:-24px 0 70px #000b; backdrop-filter:blur(34px) saturate(1.15); animation:drawer-in .3s cubic-bezier(.2,.8,.2,1); }
+  .playlist-overlay { position:fixed; inset:0; z-index:80; display:grid; place-items:center; padding:1rem; background:#0008; backdrop-filter:blur(5px); animation:overlay-in .2s ease; }
+  .playlist-picker { display:flex; flex-direction:column; gap:1rem; width:min(440px,100%); max-height:min(78vh,620px); padding:1.2rem; border:1px solid rgba(255,255,255,.08); border-radius:18px; color:#fff; background:rgba(12,12,16,.78); box-shadow:0 24px 64px rgba(0,0,0,.7); backdrop-filter:blur(28px) saturate(190%); animation:drawer-in .22s ease; }
+  .playlist-picker-head { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }.playlist-picker-head h2 { margin:.32rem 0 .28rem; font-size:1.05rem; font-weight:750; letter-spacing:-.02em; }.playlist-picker-head p { margin:0; overflow:hidden; color:#ffffff70; font-size:.68rem; text-overflow:ellipsis; white-space:nowrap; }.playlist-picker-head .round-button { flex:0 0 auto; width:32px; height:32px; }
+  .playlist-filter { display:flex; align-items:center; gap:.55rem; padding:.58rem .7rem; border:1px solid rgba(255,255,255,.08); border-radius:10px; background:rgba(255,255,255,.04); }.playlist-filter svg { width:15px; height:15px; flex:0 0 auto; fill:none; stroke:#ffffff70; stroke-width:1.8; stroke-linecap:round; }.playlist-filter input { width:100%; min-width:0; border:0; outline:0; color:#fff; background:transparent; font:500 .72rem Inter,ui-sans-serif,sans-serif; }.playlist-filter input::placeholder { color:#ffffff55; }
+  .playlist-picker-list { display:flex; flex-direction:column; gap:.42rem; min-height:0; overflow-y:auto; padding:.1rem .1rem .2rem; scrollbar-width:thin; scrollbar-color:#ffffff2c transparent; }.playlist-picker-list::-webkit-scrollbar { width:5px; }.playlist-picker-list::-webkit-scrollbar-thumb { border-radius:99px; background:#ffffff2c; }
+  .playlist-create-row,.playlist-choice { display:flex; align-items:center; gap:.75rem; width:100%; padding:.62rem .7rem; border:1px solid rgba(255,255,255,.05); border-radius:12px; color:#fff; background:rgba(255,255,255,.03); text-align:left; cursor:pointer; transition:all .18s ease; }.playlist-create-row:hover,.playlist-choice:hover:not(:disabled) { border-color:rgba(255,255,255,.14); background:rgba(255,255,255,.08); transform:translateY(-1px); }.playlist-create-icon { display:grid; place-items:center; width:34px; height:34px; border-radius:10px; color:#111; background:#fff; font-size:1.1rem; }.playlist-create-row > span:last-child,.playlist-choice-copy { display:flex; min-width:0; flex:1; flex-direction:column; gap:.18rem; }.playlist-create-row strong,.playlist-choice-copy strong { font-size:.72rem; }.playlist-create-row small,.playlist-choice-copy small { color:#ffffff62; font-size:.62rem; }.inline-playlist-create { display:flex; align-items:center; gap:.45rem; padding:.55rem .65rem; border:1px solid rgba(255,255,255,.1); border-radius:10px; background:rgba(255,255,255,.05); }.inline-playlist-create input,.playlist-name-field input { min-width:0; flex:1; padding:.42rem .5rem; border:1px solid rgba(255,255,255,.1); border-radius:8px; outline:0; color:#fff; background:#0005; font:500 .7rem Inter,ui-sans-serif,sans-serif; }.inline-playlist-create button,.playlist-primary { border:0; border-radius:999px; padding:.48rem .72rem; color:#0a0a0c; background:#fff; cursor:pointer; font-size:.63rem; font-weight:700; white-space:nowrap; transition:transform .18s ease; }.inline-playlist-create button:hover:not(:disabled),.playlist-primary:hover:not(:disabled) { transform:scale(1.02); }.inline-playlist-create button:disabled,.playlist-primary:disabled { cursor:default; opacity:.45; }.playlist-choice-art { display:grid; place-items:center; width:38px; height:38px; flex:0 0 auto; overflow:hidden; border-radius:9px; color:#d8cbbf; background:linear-gradient(135deg,#252331,#4d3640); }.playlist-choice-art img { width:100%; height:100%; object-fit:cover; }.playlist-choice-state { flex:0 0 auto; color:#ffffff55; font-size:.62rem; }.playlist-choice.playlist-added { border-color:#34d39955; background:#34d39912; }.playlist-choice.playlist-added .playlist-choice-state { color:#86efac; }.playlist-picker-empty { padding:1.5rem .5rem; color:#ffffff65; text-align:center; font-size:.7rem; }.queue-save-dialog { width:min(380px,100%); }.playlist-name-field { display:flex; flex-direction:column; gap:.42rem; color:#ffffff9c; font-size:.68rem; font-weight:650; }.playlist-primary { width:100%; padding:.7rem; font-size:.7rem; }
+  .queue-save-all { border:1px solid #ffffff16; border-radius:999px; padding:.42rem .65rem; color:#ffffffb0; background:#ffffff08; cursor:pointer; font-size:.6rem; font-weight:650; white-space:nowrap; transition:background .18s ease,transform .18s ease; }.queue-save-all:hover:not(:disabled) { color:#fff; background:#ffffff16; transform:scale(1.02); }.queue-save-all:disabled { cursor:default; opacity:.32; }
   .queue-header { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding-bottom:.75rem; border-bottom:1px solid #ffffff0f; }
   .queue-switcher { display:flex; align-items:center; gap:.2rem; min-width:0; padding:.2rem; border:1px solid #ffffff0d; border-radius:10px; background:#ffffff05; }
   .queue-switcher button { border:0; border-radius:8px; padding:.42rem .62rem; color:#ffffff55; background:transparent; cursor:pointer; font-size:.68rem; font-weight:600; transition:color .18s ease,background .18s ease; }

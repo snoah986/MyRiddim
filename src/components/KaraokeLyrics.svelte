@@ -4,6 +4,7 @@
   export let lines = []
   export let media = null
   export let currentTime = 0
+  export let clock = null
   export let playing = false
   export let onSeek = () => {}
   export let onSync = () => {}
@@ -43,6 +44,13 @@
   }
 
   function time() {
+    // An explicit clock function takes precedence so Theatre Mode can feed a
+    // studio-referenced lyric time (VideoTime - introOffset) instead of raw
+    // media currentTime during video playback.
+    if (typeof clock === 'function') {
+      const value = Number(clock())
+      return Number.isFinite(value) ? value : 0
+    }
     const value = Number(media?.currentTime)
     return Number.isFinite(value) ? value : Number(currentTime) || 0
   }

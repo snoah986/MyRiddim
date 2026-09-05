@@ -99,21 +99,36 @@ def party_create():
 
 
 def _lan_ip():
-    """Best-effort LAN address guests can reach (UDP connect probes the route
-    without sending packets). Falls back to localhost when offline."""
+    """Best-effort LAN address guests can reach.
+
+    Prefers the routed adapter's address (UDP connect probes the route without
+    sending packets), then the hostname-resolved IPv4 address, skipping
+    loopback results so 127.0.0.1/localhost is never handed to guests. Falls
+    back to loopback only when the machine genuinely has no reachable network
+    route (fully offline)."""
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
+        ip = sock.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            return ip
     except OSError:
-        return "127.0.0.1"
+        pass
     finally:
         try:
             if sock:
                 sock.close()
         except OSError:
             pass
+    try:
+        for entry in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = entry[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
 
 
 def party_invite_url(code):
@@ -3412,13 +3427,18 @@ audio_stream_cache_lock = threading.Lock()
 def _progressive_video_url(video_id):
     """Resolve one browser-playable, pre-muxed stream without runtime muxing.
 
-    The format ladder intentionally never combines bestvideo+bestaudio: native
-    HTML5 playback needs one progressive file with both codecs.  Format 22 and
-    18 are kept as explicit fallbacks because they are YouTube's dependable
-    muxed MP4 formats when a client does not advertise a richer progressive
-    stream.  After the quality tiers the ladder relaxes to worst[ext=mp4],
-    worstvideo[ext=mp4], worst[ext=webm], then bare worst so a video whose
-    only progressive option is WebM still resolves instead of failing.
+    The ladder explicitly targets 1080p progressive MP4 first (an exact
+    height=1080 tier, then any progressive MP4 up to 1080p), so Theatre Mode
+    receives a crisp full-HD stream instead of letting the extractor drift to
+    lower resolutions.  The ladder intentionally never combines
+    bestvideo+bestaudio: native HTML5 playback needs one progressive file with
+    both codecs, and combining DASH pairs would require runtime muxing that
+    delays rendering.  Format 22 and 18 are kept as explicit fallbacks because
+    they are YouTube's dependable muxed MP4 formats when a client does not
+    advertise a richer progressive stream.  After the quality tiers the ladder
+    relaxes to worst[ext=mp4], worstvideo[ext=mp4], worst[ext=webm], then bare
+    worst so a video whose only progressive option is WebM still resolves
+    instead of failing.
     """
     import yt_dlp
     attempts = [
@@ -3432,7 +3452,7 @@ def _progressive_video_url(video_id):
         options = {
             # Never add a DASH pair here: that would require runtime muxing and
             # makes the browser wait for a second stream before it can render.
-            "format": "best[ext=mp4][protocol^=http][acodec!=none][vcodec!=none][height<=1080]/22/18/worst[ext=mp4]/worstvideo[ext=mp4]/worst[ext=webm]/worst",
+            "format": "best[ext=mp4][protocol^=http][acodec!=none][vcodec!=none][height=1080]/best[ext=mp4][protocol^=http][acodec!=none][vcodec!=none][height<=1080]/22/18/worst[ext=mp4]/worstvideo[ext=mp4]/worst[ext=webm]/worst",
             "format_sort": ["res:1080", "fps:30", "br"],
             "quiet": True,
             "no_warnings": True,
@@ -3793,13 +3813,10 @@ def serve_mobile():
     return send_from_directory(STATIC_DIR, "mobile.html")
 
 if __name__ == "__main__":
-    # LAN/VPN remote mode is opt-in. Keep localhost as the safe default because
-    # this process holds the user's Google session cookies. For an iPhone on a
-    # trusted home LAN, set YTM_BIND_HOST=0.0.0.0 and optionally restrict
-    # YTM_CORS_ORIGINS to the exact frontend origin.
-    host = os.getenv("YTM_BIND_HOST", "127.0.0.1")
-
-
-if __name__ == "__main__":
+    # Bind to all interfaces so the mobile remote and Party Mode guests can
+    # reach the host over the LAN; _lan_ip() hands guests the machine's real
+    # adapter address, never loopback. Set YTM_BIND_HOST=127.0.0.1 to restrict
+    # to localhost only, and YTM_BACKEND_PORT to change the port.
+    host = os.getenv("YTM_BIND_HOST", "0.0.0.0")
     port = int(os.environ.get("YTM_BACKEND_PORT", 5178))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host=host, port=port, debug=False)

@@ -16,12 +16,14 @@
         "title": "ytm-player",
         "width": 1200,
         "height": 800,
-        "minWidth": 900,
-        "minHeight": 600,
+        "maximized": true,
+        "minWidth": 980,
+        "minHeight": 640,
         "resizable": true,
         "fullscreen": false,
         "center": true,
         "decorations": false,
+        "backgroundColor": "#09090b",
         "theme": "Dark"
       }
     ],
@@ -29,8 +31,16 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/snoah986/MyRiddim/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis", "app", "dmg"],
     "icon": [
       "icons/32x32.png",
