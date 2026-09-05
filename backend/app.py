@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import os
 import tempfile
+import subprocess
 import sqlite3
 import re
 import hashlib
@@ -76,6 +77,7 @@ CORS(app, origins=[
 ] + [origin.strip().rstrip('/') for origin in os.getenv('YTM_CORS_ORIGINS', '').split(',') if origin.strip()])
 
 ROOT = Path(__file__).resolve().parent.parent
+UPDATE_LOCK = threading.Lock()
 
 
 @app.get("/api/party/state")
@@ -1670,6 +1672,88 @@ def health():
                     "ytmusic": get_yt() is not None,
                     "authenticated": AUTHENTICATED and session != "expired",
                     "session": session})
+
+
+@app.post("/api/system/update")
+def trigger_system_update():
+    """Fetch and fast-forward a source checkout, returning real update state.
+
+    Packaged builds normally use Tauri's signed updater. This bridge is for
+    source/dev installs: it refuses to touch a dirty or diverged checkout, so
+    clicking the button can never overwrite local work or create a merge.
+    """
+    if not UPDATE_LOCK.acquire(blocking=False):
+        return jsonify({"success": False, "code": "update_in_progress", "message": "An update is already in progress."}), 409
+
+    def run_git(*args, timeout=15):
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+
+    try:
+        if not (ROOT / ".git").exists():
+            return jsonify({
+                "success": False,
+                "code": "git_unavailable",
+                "message": "This packaged install is not a Git checkout; use the signed desktop updater.",
+            }), 503
+
+        status = run_git("status", "--porcelain=v1")
+        if status.returncode != 0:
+            return jsonify({"success": False, "code": "git_status_failed", "message": status.stderr.strip() or "Could not inspect the checkout."}), 500
+        if status.stdout.strip():
+            return jsonify({
+                "success": False,
+                "code": "dirty_checkout",
+                "message": "Update blocked: commit or stash local changes before updating.",
+                "changed_files": status.stdout.splitlines()[:50],
+            }), 409
+
+        branch = run_git("branch", "--show-current").stdout.strip()
+        upstream = run_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        if upstream.returncode != 0 or not upstream.stdout.strip():
+            return jsonify({"success": False, "code": "no_upstream", "message": "Update blocked: the current branch has no remote tracking branch."}), 409
+        upstream_name = upstream.stdout.strip()
+
+        fetch = run_git("fetch", "--prune", "origin", timeout=15)
+        if fetch.returncode != 0:
+            return jsonify({"success": False, "code": "fetch_failed", "message": "Failed to contact the remote repository.", "error": fetch.stderr.strip()[:1000]}), 502
+
+        counts = run_git("rev-list", "--left-right", "--count", f"HEAD...{upstream_name}")
+        if counts.returncode != 0:
+            return jsonify({"success": False, "code": "compare_failed", "message": "Could not compare local and remote commits."}), 500
+        try:
+            ahead, behind = (int(value) for value in counts.stdout.split())
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "code": "compare_failed", "message": "Could not parse local and remote commit counts."}), 500
+
+        current = run_git("rev-parse", "--short", "HEAD").stdout.strip()
+        if behind == 0:
+            return jsonify({"success": True, "updated": False, "commit": current, "branch": branch, "ahead": ahead, "behind": behind, "message": "App is already up to date."})
+        if ahead:
+            return jsonify({"success": False, "code": "diverged_history", "message": "Update blocked: local and remote history have diverged; resolve it manually.", "branch": branch, "ahead": ahead, "behind": behind}), 409
+
+        pull = run_git("pull", "--ff-only", timeout=30)
+        if pull.returncode != 0:
+            return jsonify({"success": False, "code": "pull_failed", "message": "Fast-forward update failed; no files were changed.", "error": pull.stderr.strip()[:1000]}), 409
+        commit = run_git("rev-parse", "--short", "HEAD").stdout.strip()
+        return jsonify({"success": True, "updated": True, "commit": commit, "branch": branch, "ahead": 0, "behind": 0, "message": f"Updated successfully to commit {commit}. Reload to apply."})
+    except subprocess.TimeoutExpired:
+        return jsonify({"success": False, "code": "update_timeout", "message": "Update timed out."}), 504
+    except FileNotFoundError:
+        return jsonify({"success": False, "code": "git_unavailable", "message": "Git is not installed; use the signed desktop updater."}), 503
+    except Exception as error:
+        traceback.print_exc()
+        return jsonify({"success": False, "code": "update_failed", "message": str(error)}), 500
+    finally:
+        UPDATE_LOCK.release()
 
 
 @app.post("/api/auth/logout")

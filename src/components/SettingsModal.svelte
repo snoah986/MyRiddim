@@ -23,6 +23,7 @@
   let updateSupported = false
   let updateChecking = false
   let updateAvailable = null
+  let updateResult = null
   let updateError = ''
   let updateInstalling = false
   let updateProgress = 0
@@ -67,24 +68,45 @@
   })
 
   async function checkForUpdates({ silent = false } = {}) {
-    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
-      if (!silent) updateError = 'Updates are available in the packaged desktop app.'
-      return
-    }
-    updateSupported = true
+    const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+    updateSupported = inTauri
     updateChecking = true
     updateError = ''
+    updateResult = null
+    updateAvailable = null
     try {
-      const { check } = await import('@tauri-apps/plugin-updater')
-      updateAvailable = await check()
-      if (!updateAvailable && !silent) onToast('You are up to date')
+      if (inTauri) {
+        const { check } = await import('@tauri-apps/plugin-updater')
+        updateAvailable = await check()
+        if (!updateAvailable && !silent) onToast('You are up to date')
+        return
+      }
+
+      // Source/dev installs use the local Flask bridge. It refuses dirty or
+      // diverged checkouts and uses --ff-only, so an update cannot overwrite
+      // uncommitted work or silently create a merge.
+      const response = await apiFetch('/api/system/update', { method: 'POST' })
+      let data = null
+      try { data = await response.json() } catch { data = null }
+      updateResult = data
+      if (!response.ok || !data?.success) {
+        updateError = data?.message || `Update check failed (${response.status})`
+        if (!silent) onToast(updateError)
+        return
+      }
+      if (!silent) onToast(data.updated ? `Updated to ${data.commit}` : data.message || 'You are up to date')
     } catch (error) {
       updateAvailable = null
-      updateError = error?.message || 'Could not check for updates.'
+      updateResult = null
+      updateError = error?.message || 'Could not contact the update service.'
       if (!silent) onToast('Could not check for updates')
     } finally {
       updateChecking = false
     }
+  }
+
+  function reloadAfterUpdate() {
+    window.location.reload()
   }
 
   async function installUpdate() {
@@ -292,9 +314,11 @@
       <section class="group">
         <h3 class="group-title">Software Updates</h3>
         <div class="row">
-          <div class="row-label"><strong>Freebuff Desktop</strong><small>{#if updateAvailable}Version {updateAvailable.version} is ready to install.{:else if updateError}{updateError}{:else if updateSupported}Checks signed GitHub Releases in the background.{:else}Install the packaged desktop app to receive signed updates.{/if}</small></div>
+          <div class="row-label"><strong>Freebuff Desktop</strong><small>{#if updateAvailable}Version {updateAvailable.version} is ready to install.{:else if updateResult?.updated}Updated to commit {updateResult.commit}. Reload to apply.{:else if updateResult && !updateResult.updated && updateResult.success}{updateResult.message}{:else if updateError}{updateError}{:else if updateSupported}Checks signed GitHub Releases in the background.{:else}Source installs check the local Git bridge; packaged installs receive signed updates.{/if}</small></div>
           {#if updateAvailable}
             <button class="ghost" on:click={installUpdate} disabled={updateInstalling}>{updateInstalling ? (updateProgress ? `Installing ${Math.round(updateProgress)}%` : 'Installing…') : 'Install update'}</button>
+          {:else if updateResult?.updated}
+            <button class="ghost" on:click={reloadAfterUpdate}>Reload to apply</button>
           {:else}
             <button class="ghost" on:click={() => checkForUpdates()} disabled={updateChecking}>{updateChecking ? 'Checking…' : 'Check for updates'}</button>
           {/if}

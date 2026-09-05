@@ -1032,6 +1032,12 @@
     const requestId = ++searchRequest
     searchError = ''
     if (!value.trim()) { searchResults = []; searching = false; return }
+    // Keep the same focused input in the active shell and switch the content
+    // view synchronously on the first non-empty keystroke.
+    if (homeView !== 'search') {
+      homeView = 'search'
+      try { localStorage.setItem('ytm.view', 'search') } catch { /* storage is optional */ }
+    }
     searching = true
     searchTimer = setTimeout(async () => {
       try {
