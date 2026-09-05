@@ -1,11 +1,21 @@
 <script>
   import StartMixButton from './StartMixButton.svelte'
+  import { parseMixSubtitle, handleEntityClick } from '../utils/navigation.js'
 
   export let title = ''
   export let tracks = []
   export let onPlayTrack = () => {}
   export let onStartMix = () => {}
+  export let onOpenArtist = () => {}
   const clean = value => String(value ?? '').replace(/[\\\n\r\t]+/g, ' ').replace(/\s+/g, ' ').trim()
+  function artistsFor(track) { return parseMixSubtitle(track?.artists || track?.artist) }
+  function openArtist(event, artist) {
+    event.stopPropagation()
+    handleEntityClick(artist, path => {
+      if (path.startsWith('/artist/')) onOpenArtist(artist.id, artist.name)
+      else onOpenArtist(null, artist.name)
+    })
+  }
 </script>
 
 <section class="tile-shelf">
@@ -13,10 +23,10 @@
   <div class="tile-grid">
     {#each tracks as t, i (t.videoId || i)}
     <div class="tile-wrap mixable-track">
-    <button class="tile" on:click={() => onPlayTrack(t, i)}>
+    <div class="tile" role="button" tabindex="0" on:click={() => onPlayTrack(t, i)} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onPlayTrack(t, i) } }}>
       <div class="tile-art">{#if t.thumbnail}<img src={t.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}<i>▶</i></div>
-      <strong>{clean(t.title)}</strong><span>{clean(t.artist)}</span>
-    </button>
+      <strong>{clean(t.title)}</strong><span class="artist-line">{#each artistsFor(t) as artist, artistIndex}{#if artistIndex}, {/if}<button type="button" class="artist-link" on:click={(event) => openArtist(event, artist)}>{clean(artist.name)}</button>{/each}</span>
+    </div>
     <StartMixButton track={t} onStartMix={onStartMix} />
     </div>
     {/each}
@@ -41,5 +51,5 @@
   .tile:hover .tile-art { box-shadow: 0 12px 30px rgba(0,0,0,.6); }
   .tile strong, .tile > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tile strong { font-size: .88rem; }
-  .tile > span { color: #a1a1aa; font-size: .78rem; margin-top: 3px; }
+  .tile > span { color: #a1a1aa; font-size: .78rem; margin-top: 3px; }.artist-line { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.artist-link { padding:0; border:0; color:inherit; background:none; cursor:pointer; font:inherit; }.artist-link:hover { color:#fff; text-decoration:underline; }
 </style>

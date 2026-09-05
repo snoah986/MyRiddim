@@ -195,7 +195,7 @@
     // upvote queued requests when democratic upvoting is on. Transport stays
     // host-only; the party tab replaces the remote controls while active.
     let party = null, partyGuest = null, partyTimer = null, partyCooldown = 0, partyCooldownTick = null, partyVoted = new Set(), partyPlayNext = false, partySkipVoted = false, partySkipFor = null;
-    function partyParams() { const params=new URLSearchParams(location.search); return (params.get('party')||'').toUpperCase(); }
+    function partyParams() { const params=new URLSearchParams(location.search); return (params.get('party') || params.get('room') || '').toUpperCase(); }
     function partyActive() { return !!(party && party.active && partyGuest); }
     function setCooldown(seconds) {
       partyCooldown = Math.max(0, Number(seconds)||0);
@@ -235,14 +235,24 @@
       list.querySelectorAll('[data-add]').forEach(button => button.addEventListener('click', () => requestTrack(button.dataset.add)));
     }
     async function joinParty(code, name) {
+      const overlay = document.getElementById('join-overlay');
+      const button = document.getElementById('join-go');
+      if (button) { button.disabled = true; button.textContent = 'Joining…'; }
       try {
         const data = await request('/api/party/join', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code, name})});
+        if (!data || data.success !== true || !data.guest_id) throw Error('Join was not accepted');
         partyGuest = { id: data.guest_id, name: data.name, role: 'guest', code };
         localStorage.setItem('myriddim.partyGuest', JSON.stringify(partyGuest));
         party = { active: true, ...party, ...data };
+        if (overlay) overlay.hidden = true;
         enterPartyMode();
         showToast(`Joined ${code}`);
-      } catch (error) { showToast(error.message || 'Could not join'); }
+      } catch (error) {
+        if (overlay) overlay.hidden = false;
+        showToast(error.message || 'Could not join');
+      } finally {
+        if (button) { button.disabled = false; button.textContent = 'Join'; }
+      }
     }
     function enterPartyMode() {
       document.getElementById('party-tab').hidden = false;
@@ -312,7 +322,6 @@
       overlay.hidden = false;
       document.getElementById('join-go').onclick = () => {
         const name = document.getElementById('join-name').value.trim() || 'Guest';
-        overlay.hidden = true;
         joinParty(code, name);
       };
       document.getElementById('join-name').focus();

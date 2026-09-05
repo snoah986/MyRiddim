@@ -60,11 +60,44 @@ export function normalizeAlbum(track) {
   return name ? { name, id: id ?? null } : null
 }
 
+function cleanMixName(value) {
+  return String(value ?? '').replace(/[.…]+$/g, '').replace(/\s+/g, ' ').trim()
+}
+
+export function parseMixSubtitle(subtitle) {
+  const values = Array.isArray(subtitle) ? subtitle : [subtitle]
+  const items = values.flatMap(value => {
+    if (value && typeof value === 'object' && !Array.isArray(value)) return [value]
+    return String(value ?? '').split(',')
+  })
+  const seen = new Set()
+  return items.map(item => {
+    const name = cleanMixName(entityName(item) || item)
+    const id = entityId(item)
+    return name ? { name, id: id != null ? String(id) : null } : null
+  }).filter(item => {
+    if (!item || seen.has(item.name.toLowerCase())) return false
+    seen.add(item.name.toLowerCase())
+    return true
+  })
+}
+
+export function handleEntityClick(entity, navigate) {
+  const name = cleanMixName(entityName(entity))
+  const id = entityId(entity)
+  if (!name || typeof navigate !== 'function') return
+  if (id) navigate(`/artist/${encodeURIComponent(id)}`)
+  else navigate(`/search?q=${encodeURIComponent(name)}&type=artist`)
+}
+
 export function openArtist(artist, router) {
   const name = entityName(artist)
   const id = entityId(artist)
   if (!name) return
-  if (typeof router === 'function') router(`/artist/${encodeURIComponent(id ?? name)}`)
+  if (typeof router === 'function') {
+    if (id) router(`/artist/${encodeURIComponent(id)}`)
+    else router(`/search?q=${encodeURIComponent(name)}&type=artist`)
+  }
 }
 
 export function openAlbum(album, router) {

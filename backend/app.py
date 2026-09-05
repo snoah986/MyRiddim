@@ -9,6 +9,7 @@ import re
 import hashlib
 import math
 import socket
+import signal
 import threading
 import time
 import traceback
@@ -23,19 +24,27 @@ from flask import Flask, jsonify, request, send_file, send_from_directory, Respo
 from flask_cors import CORS
 
 try:
+    from .media_engine import media_engine_bp
+except ImportError:
+    from media_engine import media_engine_bp
+
+try:
     from .matcher import backfill_listens, ingest_track
     from .providers.soundcloud import SoundCloudProvider
     from .radio import normalize_radio_tracks
     from .party import PARTY_STORE, PartyStore
     from .lyrics_yrc import build_cadence_lines, fetch_netease_yrc
+    from .tunnel import TUNNEL_MANAGER
 except ImportError:
     from matcher import backfill_listens, ingest_track
     from providers.soundcloud import SoundCloudProvider
     from radio import normalize_radio_tracks
     from party import PARTY_STORE, PartyStore
     from lyrics_yrc import build_cadence_lines, fetch_netease_yrc
+    from tunnel import TUNNEL_MANAGER
 
 app = Flask(__name__)
+app.register_blueprint(media_engine_bp)
 
 # The desktop player is the source of truth. Remote clients enqueue commands
 # here, while the desktop frontend polls and acknowledges them. Keeping this
@@ -90,6 +99,37 @@ def party_state():
     return jsonify({"active": True, **room.public_state()})
 
 
+def get_local_ip():
+    """Return the host adapter address that other devices can reach."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # UDP connect selects the active route without sending application data.
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+@app.get("/api/system/network-info")
+def system_network_info():
+    """Return the address a Party guest should use to reach this host."""
+    public_url = os.getenv("PUBLIC_URL") or TUNNEL_MANAGER.public_url or None
+    return jsonify({
+        "lanIp": get_local_ip(),
+        "port": int(os.getenv("YTM_VITE_PORT", 5193)),
+        "publicUrl": public_url,
+    })
+
+
+@app.get("/api/system/public-url")
+def system_public_url():
+    """Compatibility endpoint for clients that only need the public URL."""
+    public_url = os.getenv("PUBLIC_URL") or TUNNEL_MANAGER.public_url
+    return jsonify({"url": public_url, "provider": TUNNEL_MANAGER.provider})
+
+
 @app.post("/api/party/create")
 def party_create():
     data = request.get_json(silent=True) or {}
@@ -134,8 +174,11 @@ def _lan_ip():
 
 
 def party_invite_url(code):
-    port = os.getenv("YTM_BACKEND_PORT", "5178")
-    return f"http://{_lan_ip()}:{port}/mobile?party={code}"
+    public_url = os.getenv("PUBLIC_URL") or TUNNEL_MANAGER.public_url
+    if public_url:
+        return f"{public_url.rstrip('/')}/party?room={urllib.parse.quote(str(code), safe='')}"
+    port = int(os.getenv("YTM_VITE_PORT", 5193))
+    return f"http://{_lan_ip()}:{port}/party?room={urllib.parse.quote(str(code), safe='')}"
 
 
 @app.post("/api/party/close")
@@ -167,7 +210,7 @@ def party_join():
     if not room:
         return jsonify({"error": "Room not found"}), 404
     guest = PartyStore.join(room, clean(data.get("name")))
-    return jsonify({"guest_id": guest.id, "name": guest.name, **room.public_state()}), 201
+    return jsonify({"success": True, "guest_id": guest.id, "name": guest.name, **room.public_state()}), 201
 
 
 @app.get("/api/party/queue")
@@ -422,6 +465,11 @@ def valid_canonical_id(value):
 def valid_playlist_id(value):
     """Playlist/browse IDs are short base64url-ish strings (PL..., LM, WL...)."""
     return bool(value) and bool(PLAYLIST_ID_RE.match(str(value)))
+
+
+def is_radio_playlist_id(value):
+    """Return whether an ID names a YouTube Music generated radio station."""
+    return str(value or '').upper().startswith(('RD', 'RDTMAK', 'RDAMPL', 'RDCLAK'))
 
 
 def valid_browse_id(value):
@@ -2658,6 +2706,54 @@ def quick_picks():
     except Exception as exc:
         return api_error(exc)
 
+@app.post("/api/queue/artist-mix")
+@rate_limit("artist_mix", 6, 60)
+def artist_mix_queue():
+    """Build a balanced queue from two to four requested artists.
+
+    Artist names and browse IDs are accepted because library payloads use both.
+    Each artist contributes a small top-song pool; the final queue is emitted
+    round-robin so one catalog cannot crowd out the others.
+    """
+    payload = request.get_json(silent=True) or {}
+    artists = payload.get("artists")
+    if not isinstance(artists, list):
+        return jsonify({"error": "artists must be an array", "tracks": []}), 400
+    artists = [clean(item.get("name") if isinstance(item, dict) else item) for item in artists]
+    artists = list(dict.fromkeys(item for item in artists if item))
+    if not 2 <= len(artists) <= 4:
+        return jsonify({"error": "Choose between 2 and 4 artists", "tracks": []}), 400
+    client = get_yt()
+    if client is None:
+        return jsonify({"error": "ytmusicapi is not available", "tracks": []}), 502
+    try:
+        pools = []
+        for artist in artists:
+            matches = client.search(artist, filter="songs", limit=10) or []
+            pool, seen = [], set()
+            for item in matches:
+                track = track_data(item)
+                if not track or track["videoId"] in seen:
+                    continue
+                seen.add(track["videoId"])
+                track["mix_artist"] = artist
+                pool.append(track)
+            pools.append(pool)
+        tracks = []
+        index = 0
+        while len(tracks) < 40 and any(index < len(pool) for pool in pools):
+            for pool in pools:
+                if index < len(pool):
+                    tracks.append(pool[index])
+                    if len(tracks) >= 40:
+                        break
+            index += 1
+        return jsonify({"artists": artists, "tracks": tracks, "source": "artist_search_round_robin"})
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc), "tracks": []}), 502
+
+
 @app.get("/api/recommendations")
 @rate_limit("recommendations", 12, 10)
 def recommendations():
@@ -3284,16 +3380,24 @@ def playlist(pid):
     if not valid_playlist_id(pid):
         return jsonify({"error": "Invalid playlist id"}), 400
     try:
-        # Public playlists stay viewable even after a session lapses: retry with a
-        # fresh unauthenticated client when the authenticated call fails.
-        try:
-            data = client.get_playlist(pid, limit=None)
-        except Exception:
-            if not is_auth_failure(sys.exc_info()[1]):
-                raise
-            from ytmusicapi import YTMusic
-            client = YTMusic()
-            data = client.get_playlist(pid, limit=None)
+        # Generated Supermix/Radio IDs are watch playlists, not ordinary
+        # library playlists. Calling get_playlist() for them can crash or
+        # return an empty shell, so route them through the provider's radio
+        # resolver and keep the same normalized track contract for the UI.
+        if is_radio_playlist_id(pid):
+            data = client.get_watch_playlist(playlistId=pid, limit=50) or {}
+        else:
+            # Public playlists stay viewable even after a session lapses: retry
+            # with a fresh unauthenticated client when the authenticated call
+            # fails.
+            try:
+                data = client.get_playlist(pid, limit=None)
+            except Exception:
+                if not is_auth_failure(sys.exc_info()[1]):
+                    raise
+                from ytmusicapi import YTMusic
+                client = YTMusic()
+                data = client.get_playlist(pid, limit=None)
         tracks = [track for item in data.get("tracks", []) if (track := track_data(item))]
         # Record the view so /api/playlists/recent can surface it.
         try:
@@ -3317,7 +3421,7 @@ def playlist(pid):
                 owned = clean(pid) in library_ids
         except Exception:
             owned = False
-        return jsonify({"id": clean(pid), "title": clean(data.get("title", pid)),
+        return jsonify({"id": clean(pid), "title": clean(data.get("title") or data.get("playlistTitle") or pid),
                         "owned": owned,
                         "thumbnail": thumbnail(data.get("thumbnails")) or (tracks[0].get("thumbnail") if tracks else None),
                         "canvas": artwork(data.get("thumbnails"))["canvas"] or (tracks[0].get("canvas") if tracks else None),
@@ -3893,6 +3997,7 @@ def proxy_stream(video_id):
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 @app.route("/mobile")
+@app.route("/party")
 def serve_mobile():
     return send_from_directory(STATIC_DIR, "mobile.html")
 
@@ -3901,6 +4006,18 @@ if __name__ == "__main__":
     # reach the host over the LAN; _lan_ip() hands guests the machine's real
     # adapter address, never loopback. Set YTM_BIND_HOST=127.0.0.1 to restrict
     # to localhost only, and YTM_BACKEND_PORT to change the port.
-    host = os.getenv("YTM_BIND_HOST", "0.0.0.0")
+    host = os.environ.get("YTM_BIND_HOST", "0.0.0.0")
     port = int(os.environ.get("YTM_BACKEND_PORT", 5178))
-    app.run(host=host, port=port, debug=False)
+
+    def stop_tunnel(_signum=None, _frame=None):
+        TUNNEL_MANAGER.stop()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, stop_tunnel)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, stop_tunnel)
+    TUNNEL_MANAGER.start()
+    try:
+        app.run(host=host, port=port, debug=False)
+    finally:
+        TUNNEL_MANAGER.stop()

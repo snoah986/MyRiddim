@@ -230,6 +230,13 @@
   let videoDuration = 0
   let videoElement
   let videoRequest = 0
+  let backdropLoopUrl = null
+  let artistBackdropUrl = null
+  let backdropArtistKey = ''
+  let backdropVideoFailed = false
+  let backdropVideoElement
+  let backdropRequest = 0
+  let backdropRetryTimer
 
   let lyricsOpen = false
   let lyricsFullscreen = false
@@ -269,6 +276,10 @@
 
   $: reduceMotion = $settings.reduceMotion || (typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches)
   $: artUrl = resolveArt(track)
+  $: backdropArtist = track?.artists?.[0] || track?.artist || {}
+  $: backdropArtistId = clean(track?.artistId || backdropArtist?.id || backdropArtist?.browseId || '')
+  $: backdropArtistName = clean(typeof backdropArtist === 'string' ? backdropArtist : backdropArtist?.name || track?.artist || '')
+  $: if (backdropArtistId || backdropArtistName) loadArtistBackdrop(backdropArtistId, backdropArtistName)
   $: playbackTime = isVideoMode ? currentPlaybackTime : currentTime
   $: playbackDuration = isVideoMode ? (videoDuration || duration) : duration
   $: meshStyle = `--mesh-a:${meshPalette[0]};--mesh-b:${meshPalette[1]};--mesh-c:${meshPalette[2]}`
@@ -311,6 +322,43 @@
     }
     if (raw && typeof raw === 'object') return getHighResArt(raw.url || '')
     return getHighResArt(String(raw))
+  }
+
+  async function loadArtistBackdrop(artistId, artistName, force = false) {
+    const key = `${artistId}|${artistName}`
+    if (!key.replace('|', '')) return
+    if (!force && key === backdropArtistKey) return
+    backdropArtistKey = key
+    clearTimeout(backdropRetryTimer)
+    const request = ++backdropRequest
+    backdropLoopUrl = null
+    artistBackdropUrl = null
+    backdropVideoFailed = false
+    try {
+      const params = new URLSearchParams()
+      if (artistId) params.set('artistId', artistId)
+      if (artistName) params.set('artistName', artistName)
+      const response = await apiFetch(`/api/media/backdrop?${params.toString()}`)
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw Error(data.error || 'Backdrop unavailable')
+      if (request !== backdropRequest) return
+      backdropLoopUrl = data.loopUrl || null
+      artistBackdropUrl = data.backdropUrl || null
+      if (!backdropLoopUrl && artistName && request === backdropRequest) {
+        backdropRetryTimer = setTimeout(() => loadArtistBackdrop(artistId, artistName, true), 8000)
+      }
+    } catch {
+      if (request !== backdropRequest) return
+      // Album art remains the deterministic final fallback when the provider
+      // or local loop generator is unavailable.
+      backdropLoopUrl = null
+      artistBackdropUrl = null
+    }
+  }
+
+  function handleBackdropVideoError() {
+    backdropVideoFailed = true
+    backdropLoopUrl = null
   }
 
   function sampleArtwork(event) {
@@ -879,8 +927,10 @@
 
   onDestroy(() => {
     lyricRequest += 1
+    backdropRequest += 1
     stopLyricSyncLoop()
     clearTimeout(saveToastTimer)
+    clearTimeout(backdropRetryTimer)
     stopFlush()
     if (isVideoMode) exitVideoMode(true)
   })
@@ -904,7 +954,16 @@
   on:touchstart={() => wakeChrome()}
   on:mouseleave={onPointerLeave}
 >
-  <div class="mesh-backdrop" aria-hidden="true"><div class="mesh-orb orb-a"></div><div class="mesh-orb orb-b"></div><div class="mesh-orb orb-c"></div><div class="grain"></div></div>
+  <div class="mesh-backdrop" aria-hidden="true">
+    {#if backdropLoopUrl && !backdropVideoFailed}
+      <video bind:this={backdropVideoElement} class="media-backdrop" src={backdropLoopUrl} autoplay loop muted playsinline preload="auto" on:error={handleBackdropVideoError}><track kind="captions" /></video>
+    {:else if artistBackdropUrl}
+      <img class="media-backdrop" src={artistBackdropUrl} referrerpolicy="no-referrer" alt="" />
+    {:else if artUrl}
+      <img class="media-backdrop artwork-fallback" src={artUrl} referrerpolicy="no-referrer" alt="" />
+    {/if}
+    <div class="mesh-orb orb-a"></div><div class="mesh-orb orb-b"></div><div class="mesh-orb orb-c"></div><div class="grain"></div>
+  </div>
 
   <div class="theatre-content">
     <header class="theatre-topbar" class:chrome-hidden={!chromeAwake}>
@@ -1180,7 +1239,9 @@
   .theatre { position:fixed; inset:0; z-index:100; width:100vw; height:100vh; overflow:hidden; color:#fff; background:#080808; font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif; user-select:none; cursor:default; isolation:isolate; }
   .theatre.cinema-hidden { cursor:none; }
   .mesh-backdrop { position:absolute; inset:0; z-index:-2; overflow:hidden; background:#080808; }
-  .mesh-backdrop::after { content:''; position:absolute; inset:0; background:linear-gradient(180deg,#08080888 0%,#08080822 46%,#080808d9 100%); pointer-events:none; }
+  .media-backdrop { position:absolute; inset:-3%; z-index:0; width:106%; height:106%; object-fit:cover; opacity:.56; filter:brightness(.34) saturate(.82); transform:scale(1.03); transition:opacity .35s ease; }
+  .media-backdrop.artwork-fallback { opacity:.28; filter:brightness(.24) saturate(.65); }
+  .mesh-backdrop::after { content:''; position:absolute; inset:0; z-index:3; background:radial-gradient(ellipse at center,transparent 20%,#080808b8 78%,#080808f2 100%),linear-gradient(180deg,#080808aa 0%,#08080835 46%,#080808e8 100%); pointer-events:none; }
   .mesh-orb { position:absolute; width:72vw; height:72vw; max-width:980px; max-height:980px; border-radius:50%; opacity:.42; filter:blur(110px); mix-blend-mode:screen; will-change:transform; animation:mesh-drift 24s ease-in-out infinite alternate; }
   .orb-a { top:-30%; left:-16%; background:radial-gradient(circle,var(--mesh-a),transparent 68%); }
   .orb-b { top:7%; right:-27%; background:radial-gradient(circle,var(--mesh-b),transparent 68%); animation-delay:-8s; animation-duration:29s; }

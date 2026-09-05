@@ -31,10 +31,12 @@ export function seed(tracks, index = 0) {
   queue.set({ history: [], nowPlaying: list[index] || null, upNext: list.slice(index + 1).map(track => ({ ...track, queueSource: track.queueSource || 'radio' })), repeat: 'off', shuffle: false })
 }
 
+const historyEntry = track => track ? { ...track, playedAt: track.playedAt || Date.now() } : null
+
 export function selectNext() {
   queue.update(value => {
     if (!value.upNext.length) return value
-    return { ...value, history: value.nowPlaying ? [...value.history, value.nowPlaying] : value.history, nowPlaying: value.upNext[0], upNext: value.upNext.slice(1) }
+    return { ...value, history: value.nowPlaying ? [...value.history, historyEntry(value.nowPlaying)] : value.history, nowPlaying: value.upNext[0], upNext: value.upNext.slice(1) }
   })
 }
 
@@ -47,7 +49,7 @@ export function selectPrevious() {
 }
 
 export function playUpcoming(track) {
-  queue.update(value => ({ ...value, history: value.nowPlaying ? [...value.history, value.nowPlaying] : value.history, nowPlaying: track, upNext: value.upNext.filter(item => item.videoId !== track.videoId) }))
+  queue.update(value => ({ ...value, history: value.nowPlaying ? [...value.history, historyEntry(value.nowPlaying)] : value.history, nowPlaying: track, upNext: value.upNext.filter(item => item.videoId !== track.videoId) }))
 }
 
 export function playNext(track, queueSource = 'manual') {

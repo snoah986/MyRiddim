@@ -51,6 +51,7 @@
   $: activeShell = ({ sidebar: SidebarLayout, topbar: TopbarLayout, handheld: HandheldLayout }[$settings.shellLayout] || SidebarLayout)
   let radioFilling = false, radioTopupTimer = null
   let homeView = 'home', likedTracks = [], likedLoaded = false, likedLoading = false, likedError = ''
+  let artistMixLoading = false
   let libraryCached = false
   let sessionState = 'ok', playlistsLoaded = false, playlistsError = '', justSwitched = false, justSwitchTimer
   let restoring = null, sessionBannerDismissed = false, lastPersist = 0
@@ -125,10 +126,35 @@
   // App owns the room lifecycle: create/close, the 2s state poll, and the
   // reconciliation of guest requests into the one real queue. TheatreMode
   // only renders party state and reports host intents back through props.
-  function decorateParty(data) {
-    const inviteUrl = data.invite_url || (partyInviteBase ? `${partyInviteBase}/mobile?party=${data.code}` : `http://127.0.0.1:5178/mobile?party=${data.code}`)
-    if (!partyInviteBase) partyInviteBase = inviteUrl.split('?party=')[0]
-    return { ...data, inviteUrl, qrDataUrl: `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(inviteUrl)}` }
+  const isPublicTunnelUrl = value => /^https:\/\/[a-z0-9][a-z0-9-]*\.(?:trycloudflare\.com|loca\.lt)(?:\/|$)/i.test(String(value || ''))
+  function partyUrlForBase(base, code) {
+    return `${String(base).replace(/\/$/, '')}/party?room=${encodeURIComponent(code)}`
+  }
+  function partyBaseFromInvite(url) {
+    return String(url || '').replace(/\/(?:party|mobile)(?:\?.*)?\/?$/i, '')
+  }
+  function decorateParty(data, inviteUrl = '') {
+    const safeFallback = inviteUrl || (typeof window !== 'undefined' ? partyUrlForBase(window.location.origin, data.code) : '')
+    const finalInvite = safeFallback
+    if (isPublicTunnelUrl(finalInvite)) partyInviteBase = partyBaseFromInvite(finalInvite)
+    return { ...data, invite_url: finalInvite, inviteUrl: finalInvite, qrDataUrl: finalInvite ? `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(finalInvite)}` : '' }
+  }
+  async function refreshPartyInviteUrl(room, attempts = 8) {
+    if (!room?.code) return room
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const response = await apiFetch('/api/system/network-info')
+        const data = await response.json()
+        const publicUrl = isPublicTunnelUrl(data.publicUrl) ? data.publicUrl : ''
+        const lanIp = String(data.lanIp || '')
+        const port = Number(data.port) || 5193
+        const lanBase = lanIp && lanIp !== '127.0.0.1' && lanIp !== 'localhost' ? `http://${lanIp}:${port}` : ''
+        const base = publicUrl || lanBase || (typeof window !== 'undefined' ? window.location.origin : '')
+        if (response.ok && base) return decorateParty(room, partyUrlForBase(base, room.code))
+      } catch { /* network discovery is best-effort */ }
+      if (attempt < attempts - 1) await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    return decorateParty(room, typeof window !== 'undefined' ? partyUrlForBase(window.location.origin, room.code) : '')
   }
   function openPartyPopover() {
     if (!partyRoom) partySetupOpen = !partySetupOpen
@@ -148,7 +174,7 @@
       if (response.status !== 201 || data.error) throw Error('Failed to start party: check backend server')
       partyAppliedIds.clear(); partyPlayedId = null; partySkipHandledId = null
       partyQueueSnapshot = [...activeQueue.upNext]
-      partyRoom = decorateParty(data)
+      partyRoom = await refreshPartyInviteUrl(decorateParty(data))
       partySetupOpen = false
       partyPopoverOpen = true
       clearInterval(partyPollTimer)
@@ -525,6 +551,31 @@
     if (!tracks) return
     playQueue(tracks)
     showToast(`Radio mix started · ${tracks.length - 1} tracks queued`)
+  }
+  async function compileArtistMix(artists) {
+    const selected = (artists || []).map(item => ({ id: item.id || null, name: clean(item.name || item.title) })).filter(item => item.name)
+    artistMixLoading = true
+    if (selected.length < 2 || selected.length > 4) {
+      showToast('Choose 2–4 artists to compile a mix')
+      return
+    }
+    try {
+      const response = await apiFetch('/api/queue/artist-mix', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ artists: selected }),
+      })
+      const data = await response.json()
+      if (!response.ok || data.error) throw Error(data.error || 'Could not compile artist mix')
+      const tracks = (data.tracks || []).map(normalizePlayable).filter(Boolean)
+      if (!tracks.length) { showToast('No playable tracks found for those artists'); return }
+      playQueue(tracks)
+      showToast(`Artist mix started · ${tracks.length} tracks queued`)
+    } catch (error) {
+      showToast(error.message || 'Could not compile artist mix')
+    } finally {
+      artistMixLoading = false
+    }
   }
   async function saveTrackToPlaylist(track, playlistId = null) {
     const rememberedId = localStorage.getItem('myriddim_last_playlist')
@@ -1026,35 +1077,44 @@
     } catch { if (announce) showToast('Radio unavailable') } finally { radioFilling = false }
   }
   function searchChanged(valueOrEvent) {
-    const value = typeof valueOrEvent === 'string' ? valueOrEvent : valueOrEvent?.currentTarget?.value ?? ''
+    const input = typeof valueOrEvent === 'string' ? null : valueOrEvent?.currentTarget
+    const value = typeof valueOrEvent === 'string' ? valueOrEvent : input?.value ?? ''
+    const query = value.trim()
     searchQuery = value
     clearTimeout(searchTimer)
     const requestId = ++searchRequest
     searchError = ''
-    if (!value.trim()) { searchResults = []; searching = false; return }
-    // Keep the same focused input in the active shell and switch the content
-    // view synchronously on the first non-empty keystroke.
+    if (!query) {
+      searchResults = []
+      searching = false
+      if (homeView === 'search') setHomeView('home')
+      return
+    }
+    // Switch synchronously on the first character. The shell owns the input,
+    // so the route change does not remount it; explicitly restoring focus also
+    // covers shells that flush their slot during the same input event.
     if (homeView !== 'search') {
       homeView = 'search'
       try { localStorage.setItem('ytm.view', 'search') } catch { /* storage is optional */ }
     }
+    Promise.resolve().then(() => input?.focus())
     searching = true
     searchTimer = setTimeout(async () => {
       try {
-        const response = await apiFetch(`/api/search?q=${encodeURIComponent(value.trim())}`)
+        const response = await apiFetch(`/api/search?q=${encodeURIComponent(query)}`)
         const data = await response.json()
         if (requestId !== searchRequest) return
         if (!response.ok || data.error) throw Error(data.error || `Search failed (${response.status})`)
+        // Keep the previous result set visible until this response succeeds.
         searchResults = Array.isArray(data.results) ? data.results : []
       } catch (error) {
         if (requestId !== searchRequest) return
         console.error('Search failed:', error)
-        searchResults = []
         searchError = error.message || 'Search unavailable'
       } finally {
         if (requestId === searchRequest) searching = false
       }
-    }, 300)
+    }, 250)
   }  function focusSearch(event) { if ((event.ctrlKey && event.key.toLowerCase() === 'k') || (event.key === '/' && !['INPUT','TEXTAREA'].includes(event.target.tagName))) { event.preventDefault(); document.querySelector('.global-search')?.focus() } }
   const CARD_SELECTOR = 'button.row-main, .tile, .playlist-card, .browse-card, .quick-card, .search-row > button, .recap, .smart-item, .hero-play, .sheet-item, .track[role="button"]'
   // Desktop-style grid navigation: arrow keys move focus to the nearest card
@@ -1297,7 +1357,7 @@
   {:else}  <svelte:component this={activeShell} homeView={homeView} searchQuery={searchQuery} onSearchChanged={searchChanged} onViewChange={setHomeView} onCreatePlaylist={() => showCreate = true} onOpenSmartCreator={() => showSmartModal = true} onOpenSettings={() => settingsOpen = true} playlists={playlists} onOpenPlaylist={open}>
     {#if artistData}<ArtistPage data={artistData} track={currentTrack} favorite={favoriteArtists.some(item => item.id === artistData?.browseId)} onToggleFavorite={() => toggleFavoriteArtist({ id: artistData?.browseId, name: artistData?.name, thumbnail: artistData?.thumbnail })} onPlay={(tracks) => tracks?.[0] && playQueue(tracks)} onTrack={(tracks, index) => playQueue(tracks, index)} onOpenAlbum={openAlbum} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onClose={() => artistData = null} />
     {:else if albumData}<AlbumPage data={albumData} track={currentTrack} onPlay={(tracks) => tracks?.[0] && playQueue(tracks)} onTrack={(tracks, index) => playQueue(tracks, index)} onOpenArtist={(id, name) => openArtistEntity(id, name)} onOpenArtistEntity={openArtistEntity} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onClose={() => albumData = null} />
-    {:else if full}<div in:fade={{ duration: 200 }} out:fade={{ duration: 120 }}><SongPage playlist={full} track={currentTrack} onTrack={(track, index) => { if (activeQueue.nowPlaying?.videoId === track.videoId) togglePlay(); else { seed(full.tracks, index) } }} onPlay={() => full?.tracks?.[0] && playQueue(full.tracks)} onShuffle={() => playQueueShuffled(full?.tracks)} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onRemoveTrack={removeTrackFromPlaylist} /></div>    {:else}<HomeView embedded searchQuery={searchQuery} onSearchChanged={searchChanged} searchResults={searchResults} searching={searching} searchError={searchError} homeView={homeView} onViewChange={setHomeView} sessionState={sessionState} sessionBannerDismissed={sessionBannerDismissed} onReconnect={reauthenticate} onDismissSession={() => sessionBannerDismissed = true} libraryCached={libraryCached} onDismissOffline={() => libraryCached = false} playlists={playlists} playlistsError={playlistsError} playlistsLoaded={playlistsLoaded} onRetryPlaylists={loadPlaylists} onOpenPlaylist={open} onCreatePlaylist={() => showCreate = true} onOpenSmartCreator={() => showSmartModal = true} onOpenSettings={() => settingsOpen = true} smartPlaylists={smartPlaylists} smartPlaylistsLoading={smartPlaylistsLoading} smartPlaylistsError={smartPlaylistsError} onRefreshSmart={loadSmartPlaylists} onOpenSmartPlaylist={openSmartPlaylist} stats={stats} quickPicks={quickPicks} smartMix={smartMix} recommendations={recommendations} currentTrack={currentTrack} recommendationLoading={recommendationLoading} likedTracks={likedTracks} likedLoading={likedLoading} likedError={likedError} onRetryLiked={loadLiked} onPlayQueue={playQueue} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenBrowse={openBrowse} onArtworkLoad={extractAccent} moods={moods} activeMood={activeMood} moodPlaylists={moodPlaylists} moodLoading={moodLoading} onOpenMood={openMood} onOpenMoodPlaylist={(item) => item.browseId && open({id: item.browseId, title: item.title})} discoverTracks={discoverTracks} discoverLoading={discoverLoading} favoriteArtists={favoriteArtists} rotationTracks={rotationTracks} recentPlaylists={recentPlaylists} ytmShelves={ytmShelves} ytmFeedLoading={ytmFeedLoading} onRetryYtmFeed={loadYtmFeed} onOpenArtistEntity={openArtistEntity} onOpenAlbumEntity={openAlbumEntity} onOpenRecentPlaylist={(item) => item?.id && open({id: item.id, title: item.title})}/>
+    {:else if full}<div in:fade={{ duration: 200 }} out:fade={{ duration: 120 }}><SongPage playlist={full} track={currentTrack} onTrack={(track, index) => { if (activeQueue.nowPlaying?.videoId === track.videoId) togglePlay(); else { seed(full.tracks, index) } }} onPlay={() => full?.tracks?.[0] && playQueue(full.tracks)} onShuffle={() => playQueueShuffled(full?.tracks)} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onRemoveTrack={removeTrackFromPlaylist} /></div>    {:else}<HomeView embedded searchQuery={searchQuery} onSearchChanged={searchChanged} searchResults={searchResults} searching={searching} searchError={searchError} homeView={homeView} onViewChange={setHomeView} sessionState={sessionState} sessionBannerDismissed={sessionBannerDismissed} onReconnect={reauthenticate} onDismissSession={() => sessionBannerDismissed = true} libraryCached={libraryCached} onDismissOffline={() => libraryCached = false} playlists={playlists} playlistsError={playlistsError} playlistsLoaded={playlistsLoaded} onRetryPlaylists={loadPlaylists} onOpenPlaylist={open} onCreatePlaylist={() => showCreate = true} onOpenSmartCreator={() => showSmartModal = true} onOpenSettings={() => settingsOpen = true} smartPlaylists={smartPlaylists} smartPlaylistsLoading={smartPlaylistsLoading} smartPlaylistsError={smartPlaylistsError} onRefreshSmart={loadSmartPlaylists} onOpenSmartPlaylist={openSmartPlaylist} stats={stats} quickPicks={quickPicks} smartMix={smartMix} recommendations={recommendations} currentTrack={currentTrack} recommendationLoading={recommendationLoading} upNext={activeQueue.upNext} history={activeQueue.history} currentTime={currentTime} duration={duration} isPlaying={isPlaying} volume={volume} loading={loadingTrack} onToggle={togglePlay} onOpenQueue={() => queueOpen = true} onOpenTheatre={() => theatreOpen = true} likedTracks={likedTracks} likedLoading={likedLoading} likedError={likedError} onRetryLiked={loadLiked} onPlayQueue={playQueue} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenBrowse={openBrowse} onArtworkLoad={extractAccent} moods={moods} activeMood={activeMood} moodPlaylists={moodPlaylists} moodLoading={moodLoading} onOpenMood={openMood} onOpenMoodPlaylist={(item) => item.browseId && open({id: item.browseId, title: item.title})} discoverTracks={discoverTracks} discoverLoading={discoverLoading} favoriteArtists={favoriteArtists} rotationTracks={rotationTracks} recentPlaylists={recentPlaylists} ytmShelves={ytmShelves} ytmFeedLoading={ytmFeedLoading} onRetryYtmFeed={loadYtmFeed} onOpenArtistEntity={openArtistEntity} onOpenAlbumEntity={openAlbumEntity} onOpenRecentPlaylist={(item) => item?.id && open({id: item.id, title: item.title})} onCompileArtistMix={compileArtistMix}/>
     {/if}
   </svelte:component>
   {/if}
