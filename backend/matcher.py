@@ -156,9 +156,27 @@ def ingest_track(
         )
         return canonical
 
-    candidates = db.execute(
-        "SELECT id, title_norm, artist_norm, duration_sec, isrc FROM canonical_tracks"
-    ).fetchall()
+    normalized_title = normalize_metadata(incoming["title"])
+    normalized_artist = normalize_metadata(incoming["artist"])
+    if isrc:
+        candidates = db.execute(
+            """SELECT id, title_norm, artist_norm, duration_sec, isrc
+               FROM canonical_tracks
+               WHERE isrc = ?
+               LIMIT 25""",
+            (str(isrc).strip(),),
+        ).fetchall()
+    else:
+        candidates = []
+
+    if not candidates:
+        candidates = db.execute(
+            """SELECT id, title_norm, artist_norm, duration_sec, isrc
+               FROM canonical_tracks
+               WHERE title_norm = ? OR artist_norm = ?
+               LIMIT 25""",
+            (normalized_title, normalized_artist),
+        ).fetchall()
     best = None
     best_match = {"score": 0.0, "action": "new", "reason": "none"}
     for candidate in candidates:

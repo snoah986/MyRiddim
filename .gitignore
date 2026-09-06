@@ -10,6 +10,8 @@ oauth.json
 
 # --- Local runtime state ---
 .freebuff/
+backend/cache/
+repomix-output.xml
 __pycache__/
 *.pyc
 

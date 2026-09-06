@@ -17,6 +17,18 @@
   function onKeydown(event) { if (event.key === 'Escape') { event.preventDefault(); onClose() } }
   onMount(() => window.addEventListener('keydown', onKeydown))
   onDestroy(() => window.removeEventListener('keydown', onKeydown))
+  let contextTrack = null
+  let contextX = 0
+  let contextY = 0
+  let contextKey = 0
+  function openContext(event, item) {
+    event.preventDefault()
+    event.stopPropagation()
+    contextTrack = item
+    contextX = event.clientX
+    contextY = event.clientY
+    contextKey += 1
+  }
   const songs = () => data?.songs || []
   const albums = () => data?.albums || []
   const singles = () => data?.singles || []
@@ -24,11 +36,12 @@
 
 <svelte:window on:keydown={onKeydown} />
 <div class="artistpage" role="dialog" aria-modal="true" aria-label={data?.name ?? 'Artist'}>
+  {#if contextTrack}<TrackContextMenu key={contextKey} track={contextTrack} entityType="track" positioned x={contextX} y={contextY} autoOpen onPlayNext={onPlayNext} onAddToQueue={onAddToQueue} onAddToPlaylist={onAddToPlaylist} onStartMix={onStartMix} />{/if}
   <header class="topbar"><button class="icon-btn" on:click={onClose} aria-label="Back" title="Back (Esc)">←</button><div class="crumb">ARTIST</div><button class="fav-btn" class:active={favorite} on:click={onToggleFavorite} aria-label={favorite ? 'Remove from favorite artists' : 'Add to favorite artists'} title={favorite ? 'Remove from favorite artists' : 'Add to favorite artists'}>{favorite ? '♥' : '♡'}<span>{favorite ? 'Saved' : 'Save'}</span></button><button class="exit" on:click={onClose} aria-label="Exit" title="Exit (Esc)">Exit</button></header>
   <div class="layout">
     <aside class="details"><div class="cover">{#if data?.thumbnail}<img src={data.thumbnail} referrerpolicy="no-referrer" alt="{clean(data.name)} artwork" />{:else}<span>♫</span>{/if}</div><h1>{clean(data?.name) || 'Artist'}</h1><p class="summary">{#if data?.subscribers}<span class="count">{clean(data.subscribers)}</span>{/if}{#if data?.views}<span class="count">{clean(data.views)} views</span>{/if}</p>{#if songs().length}<button class="play" on:click={() => onPlay(songs())} aria-label="Play popular songs">▶ <span>Play</span></button>{/if}</aside>
     <section class="content" aria-label="Artist content">
-      {#if songs().length}<section class="block"><h2>Popular</h2><div class="song-list">{#each songs() as t, i (t.videoId || i)}<div class="song-row"><button class="song-main" on:click={() => onTrack(songs(), i)}><span class="num">{track?.videoId === t.videoId ? '♪' : i + 1}</span><span class="song-art">{#if t.thumbnail}<img src={t.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="song-meta"><strong>{clean(t.title)}</strong><small>{clean(t.artist)}</small></span><span class="song-dur">{t.duration || '—'}</span><span class="song-play">▶</span></button><TrackContextMenu track={t} onPlayNext={onPlayNext} onAddToQueue={onAddToQueue} onAddToPlaylist={onAddToPlaylist} onStartMix={onStartMix} /></div>{/each}</div></section>{/if}
+      {#if songs().length}<section class="block"><h2>Popular</h2><div class="song-list">{#each songs() as t, i (t.videoId || i)}<div class="song-row" on:contextmenu|preventDefault|stopPropagation={(event) => openContext(event, t)}><button class="song-main" on:click={() => onTrack(songs(), i)}><span class="num">{track?.videoId === t.videoId ? '♪' : i + 1}</span><span class="song-art">{#if t.thumbnail}<img src={t.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="song-meta"><strong>{clean(t.title)}</strong><small>{clean(t.artist)}</small></span><span class="song-dur">{t.duration || '—'}</span><span class="song-play">▶</span></button><TrackContextMenu track={t} onPlayNext={onPlayNext} onAddToQueue={onAddToQueue} onAddToPlaylist={onAddToPlaylist} onStartMix={onStartMix} /></div>{/each}</div></section>{/if}
       {#if albums().length}<section class="block"><h2>Albums</h2><div class="card-row">{#each albums() as a (a.browseId)}<button class="release" on:click={() => onOpenAlbum(a.browseId)}><div class="card-art">{#if a.thumbnail}<img src={a.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</div><strong>{clean(a.title)}</strong><span>{clean(a.year) || clean(a.type) || 'Album'}</span></button>{/each}</div></section>{/if}
       {#if singles().length}<section class="block"><h2>Singles</h2><div class="card-row">{#each singles() as a (a.browseId)}<button class="release" on:click={() => onOpenAlbum(a.browseId)}><div class="card-art">{#if a.thumbnail}<img src={a.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</div><strong>{clean(a.title)}</strong><span>{clean(a.year) || clean(a.type) || 'Single'}</span></button>{/each}</div></section>{/if}
     </section>

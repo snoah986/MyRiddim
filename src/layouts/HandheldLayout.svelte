@@ -4,7 +4,7 @@
   export let onSearchChanged = () => {}
   export let onViewChange = () => {}
   export let onOpenSettings = () => {}
-  const navItems = [['home', 'Home', '⌂'], ['discover', 'Discover', '✦'], ['favorites', 'Favorites', '♡'], ['stats', 'Stats', '◒']]
+  const navItems = [['home', 'Home', '⌂'], ['discover', 'Discover', '✦'], ['favorites', 'Favorites', '♡'], ['stats', 'Stats', '◒'], ['updates', 'Updates', '↗']]
 </script>
 
 <div class="shell handheld-shell">

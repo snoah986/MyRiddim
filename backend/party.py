@@ -191,7 +191,7 @@ class PartyStore:
     # -- rooms ------------------------------------------------------------
     def create_room(self, host_name: str) -> PartyRoom:
         with self._lock:
-            code = "RIDD" + secrets.token_hex(2).upper()  # e.g. RIDD-84 style, 4 hex chars
+            code = "RIDD" + secrets.token_hex(3).upper()  # e.g. RIDD1A2B3C, 6 hex chars
             room = PartyRoom(code, host_name or "Host")
             self._prune()
             self._rooms[code] = room

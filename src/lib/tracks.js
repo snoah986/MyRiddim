@@ -1,4 +1,4 @@
-const PLACEHOLDER_TITLES = new Set(['unknown', 'unknown title', 'unknown audio', 'untitled', ''])
+const PLACEHOLDER_TITLES = new Set(['unknown', 'unknown title', 'unknown artist', 'unknown audio', 'untitled', ''])
 const PLACEHOLDER_ARTISTS = new Set(['unknown', 'unknown artist', 'unknown audio', 'untitled', ''])
 
 function textValue(value) {

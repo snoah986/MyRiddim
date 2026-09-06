@@ -2,6 +2,8 @@
   import TrackCard from '../components/TrackCard.svelte'
 
   export let history = []
+  export let persistentHistory = []
+  export let stats = { monthly: [], heavyRotation: [] }
   export let heavyRotation = []
   export let favoriteArtists = []
   export let onPlay = () => {}
@@ -11,42 +13,72 @@
 
   let tab = 'tracks'
   const clean = value => String(value ?? '').replace(/[\\\n\r\t]+/g, ' ').replace(/\s+/g, ' ').trim()
-  const formatTime = value => {
+  const trackKey = item => item?.videoId || item?.id || item?.title
+  const artistEntries = item => {
+    const value = item?.artists || item?.artist || item?.author
+    if (Array.isArray(value)) return value
+    return value ? [value] : []
+  }
+  const artistName = value => clean(typeof value === 'string' ? value : value?.name || value?.title)
+  const asSeconds = value => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
     const raw = String(value ?? '').trim()
+    if (!raw) return 0
     const parts = raw.split(':').map(Number)
-    const seconds = parts.length > 1 && parts.every(Number.isFinite)
-      ? parts.reduce((total, part) => total * 60 + part, 0)
-      : Number(raw) || 0
-    return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`
+    if (parts.length > 1 && parts.every(Number.isFinite)) return parts.reduce((total, part) => total * 60 + part, 0)
+    return Number(raw) || 0
+  }
+  const formatTime = value => {
+    const seconds = Math.max(0, Math.round(asSeconds(value)))
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
   }
   const relativeTime = value => {
-    const timestamp = new Date(value || 0).getTime()
-    if (!timestamp) return 'recently'
+    const timestamp = typeof value === 'number' && value < 10000000000 ? value * 1000 : new Date(value || 0).getTime()
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return 'recently'
     const minutes = Math.max(1, Math.floor((Date.now() - timestamp) / 60000))
-    return minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ago`
+    return minutes < 60 ? `${minutes}m ago` : minutes < 1440 ? `${Math.floor(minutes / 60)}h ago` : `${Math.floor(minutes / 1440)}d ago`
   }
-  $: tape = history.slice(-10).reverse()
-  $: rotation = heavyRotation.length ? heavyRotation.slice(0, 20) : history.slice(-20).reverse()
-  $: albums = [...new Map(history.filter(item => item?.album).map(item => [item.album, item])).values()]
-  $: artists = [...new Map(history.flatMap(item => Array.isArray(item?.artists) ? item.artists : [{ name: item?.artist }]).filter(item => item?.name).map(item => [item.name, item])).values()]
+
+  // The API returns newest-first. The session queue is oldest-first, so the
+  // final merge is explicitly sorted by the durable playback timestamp.
+  $: durableHistory = (persistentHistory.length ? persistentHistory : history)
+    .filter(item => item && trackKey(item))
+    .slice(-50)
+    .sort((a, b) => new Date(b.playedAt || b.played_at || b.timestamp || 0) - new Date(a.playedAt || a.played_at || a.timestamp || 0))
+  $: tape = (persistentHistory.length ? persistentHistory : history).slice(0, 10)
+  $: rotation = (heavyRotation.length ? heavyRotation : (stats.heavyRotation || durableHistory)).slice(0, 20)
+  $: albums = [...new Map(durableHistory.filter(item => clean(item.album)).map(item => {
+    const name = clean(item.album)
+    return [name, { ...item, album: name, plays: durableHistory.filter(entry => clean(entry.album) === name).length }]
+  })).values()]
+  $: artists = (() => {
+    const byName = new Map()
+    durableHistory.forEach(item => artistEntries(item).forEach(value => {
+      const name = artistName(value)
+      if (!name) return
+      const key = name.toLowerCase()
+      const existing = byName.get(key) || { name, id: value?.id || value?.browseId || item?.artistId || null, thumbnail: value?.thumbnail || item?.thumbnail, plays: 0 }
+      existing.plays += 1
+      byName.set(key, existing)
+    }))
+    return [...byName.values()].sort((a, b) => b.plays - a.plays)
+  })()
 </script>
 
-<section class="recent-page" aria-labelledby="recent-title">
-  <header class="page-header"><div><p class="eyebrow">PLAYBACK ARCHIVE</p><h1 id="recent-title">Recently played</h1><p class="lede">A clean tape of what actually moved through your decks.</p></div><span class="data-tag">LAST 10 / CHRONOLOGICAL</span></header>
-
-  <section class="tape" aria-label="Last ten tracks played">
-    <div class="section-label"><h2>Session tape</h2><span>{tape.length}/10 tracks</span></div>
-    {#if tape.length}<div class="tape-row">{#each tape as item (item.videoId)}<article class="tape-card"><span class="tape-art">{#if item.thumbnail}<img src={item.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}♫{/if}</span><span class="tape-copy"><strong>{clean(item.title)}</strong><small>{clean(item.artist)}</small><time>{relativeTime(item.playedAt || item.played_at || item.timestamp)}</time></span><button on:click={() => onPlay(item)} aria-label="Play {clean(item.title)}">▶</button></article>{/each}</div>{:else}<p class="empty">Play a few tracks and your session tape will appear here.</p>{/if}
-  </section>
+<section class="recent-page" aria-label="Recently played">
+  {#if tape.length}<section class="tape" aria-label="Last ten tracks played">
+    <div class="section-label"><h2>Session tape</h2><span>{tape.length}/10</span></div>
+    <div class="tape-row">{#each tape as item, index (trackKey(item) || index)}<article class="tape-card"><span class="tape-art">{#if item.thumbnail}<img src={item.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}♫{/if}</span><span class="tape-copy"><strong>{clean(item.title) || 'Untitled track'}</strong><small>{clean(item.artist) || 'Various Artists'}</small><time>{relativeTime(item.playedAt || item.played_at || item.timestamp)}</time></span><button on:click={() => onPlay(item)} aria-label="Play {clean(item.title)}">▶</button></article>{/each}</div>
+  </section>{/if}
 
   <nav class="segment" aria-label="Recently played sections" role="tablist">{#each [['tracks','Heavy Rotation'],['albums','Albums'],['artists','Artists']] as item}<button role="tab" aria-selected={tab === item[0]} class:active={tab === item[0]} on:click={() => tab = item[0]}>{item[1]}</button>{/each}</nav>
 
   {#if tab === 'tracks'}
-    <section class="panel rotation-panel"><div class="section-label"><div><h2>Heavy Rotation</h2><p>Your most replayed tracks this week.</p></div><span class="data-tag">TOP {rotation.length}</span></div><div class="rotation-list">{#each rotation as item, index}<TrackCard track={item} compact rank={index + 1} onPlay={onPlay} onOpenArtist={onOpenArtist} onOpenAlbum={onOpenAlbum} onAdd={onAddToQueue} />{:else}<p class="empty">Your leaderboard will build as you listen.</p>{/each}</div></section>
+    <section class="panel rotation-panel"><div class="section-label"><div><h2>Heavy Rotation</h2><p>Your most replayed tracks from the listening archive.</p></div><span class="data-tag">TOP {rotation.length}</span></div><div class="rotation-list">{#each rotation as item, index (trackKey(item) || index)}<TrackCard track={item} compact rank={index + 1} onPlay={onPlay} onOpenArtist={onOpenArtist} onOpenAlbum={onOpenAlbum} onAdd={onAddToQueue} />{:else}<p class="empty">Your leaderboard will build as you listen.</p>{/each}</div></section>
   {:else if tab === 'albums'}
-    <section class="panel"><div class="section-label"><div><h2>Albums</h2><p>Projects your recent plays touched.</p></div></div><div class="album-grid">{#each albums as album}<button class="album-card" on:click={() => onOpenAlbum(null, album.album)}><span>{#if album.thumbnail}<img src={album.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}♫{/if}</span><strong>{clean(album.album)}</strong><small>{clean(album.year) || 'Recent play'} · {history.filter(item => item.album === album.album).length} plays</small></button>{:else}<p class="empty">No album history yet.</p>{/each}</div></section>
+    <section class="panel"><div class="section-label"><div><h2>Albums</h2><p>Projects touched in your latest 50 plays.</p></div><span class="data-tag">{albums.length} PROJECTS</span></div><div class="album-grid">{#each albums as album (album.album)}<button class="album-card" on:click={() => onOpenAlbum(album.albumId || null, album.album, album.artist)}><span>{#if album.thumbnail}<img src={album.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}♫{/if}</span><strong>{clean(album.album)}</strong><small>{clean(album.artist) || 'Various Artists'} · {album.plays} plays</small></button>{:else}<p class="empty">No album history yet.</p>{/each}</div></section>
   {:else}
-    <section class="panel"><div class="section-label"><div><h2>Artists</h2><p>Artists in your current listening rotation.</p></div></div><div class="artist-grid">{#each artists as artist}<button class="artist-card" on:click={() => onOpenArtist(artist.id || null, artist.name)}><span>{#if artist.thumbnail}<img src={artist.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}♩{/if}</span><strong>{clean(artist.name)}</strong><small>{history.filter(item => item.artist === artist.name).length} plays this month</small></button>{:else}<p class="empty">No artists to show yet.</p>{/each}</div></section>
+    <section class="panel"><div class="section-label"><div><h2>Artists</h2><p>Ranked by plays in the persistent archive.</p></div><span class="data-tag">{artists.length} ARTISTS</span></div><div class="artist-grid">{#each artists as artist (artist.name)}<button class="artist-card" on:click={() => onOpenArtist(artist.id, artist.name)}><span>{#if artist.thumbnail}<img src={artist.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}♩{/if}</span><strong>{clean(artist.name)}</strong><small>{artist.plays} plays · archive</small></button>{:else}<p class="empty">No artists to show yet.</p>{/each}</div></section>
   {/if}
 </section>
 

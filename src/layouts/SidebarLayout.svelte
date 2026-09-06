@@ -18,6 +18,7 @@
     ['favorites', 'Favorites'],
     ['discover', 'Discover'],
     ['stats', 'Listening stats'],
+    ['updates', 'Updates'],
   ]
 </script>
 

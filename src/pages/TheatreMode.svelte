@@ -1,4 +1,5 @@
 <script>
+  import QRCode from 'qrcode'
   import { apiFetch } from '../lib/api.js'
   import { onDestroy, onMount, tick } from 'svelte'
   import { audio, getActiveAudio } from '../lib/audio.js'
@@ -11,6 +12,8 @@
   export let isPlaying = false
   export let currentTime = 0
   export let duration = 0
+  export let volume = 1
+  export let onVolume = () => {}
   export let shuffle = false
   export let repeat = 'off'
   export let queueOpen = false
@@ -53,6 +56,16 @@
   export let onPartySetting = () => {}
   export let onPartyCopyInvite = () => {}
   export let onPartyEnd = () => {}
+  export let onSleepTimer = () => {}
+
+  function renderQr(node, url) {
+    if (url) QRCode.toCanvas(node, url, { width: 168, margin: 1, color: { dark: '#000000', light: '#ffffff' } })
+    return {
+      update(newUrl) {
+        if (newUrl) QRCode.toCanvas(node, newUrl, { width: 168, margin: 1, color: { dark: '#000000', light: '#ffffff' } })
+      }
+    }
+  }
 
   $: connectedGuests = (party?.guests || []).filter(guest => guest.connected)
   $: pendingCount = (party?.pending || []).length
@@ -234,6 +247,7 @@
   let artistBackdropUrl = null
   let backdropArtistKey = ''
   let backdropVideoFailed = false
+  let backdropVideoPlaying = false
   let backdropVideoElement
   let backdropRequest = 0
   let backdropRetryTimer
@@ -272,6 +286,7 @@
   let tiltActive = false
   let reduceMotion = false
   let chromeAwake = true
+  let dockMoreOpen = false
   let cinemaTimer
 
   $: reduceMotion = $settings.reduceMotion || (typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches)
@@ -279,11 +294,12 @@
   $: backdropArtist = track?.artists?.[0] || track?.artist || {}
   $: backdropArtistId = clean(track?.artistId || backdropArtist?.id || backdropArtist?.browseId || '')
   $: backdropArtistName = clean(typeof backdropArtist === 'string' ? backdropArtist : backdropArtist?.name || track?.artist || '')
-  $: if (backdropArtistId || backdropArtistName) loadArtistBackdrop(backdropArtistId, backdropArtistName)
+  $: backdropTrackId = clean(track?.videoId || track?.id || '')
+  $: instantVideoBackdrop = /^[A-Za-z0-9_-]{11}$/.test(backdropTrackId) ? `https://i.ytimg.com/vi/${backdropTrackId}/maxresdefault.jpg` : ''
+  $: if (backdropTrackId || backdropArtistId || backdropArtistName) loadArtistBackdrop(backdropTrackId, backdropArtistId, backdropArtistName)
   $: playbackTime = isVideoMode ? currentPlaybackTime : currentTime
   $: playbackDuration = isVideoMode ? (videoDuration || duration) : duration
   $: meshStyle = `--mesh-a:${meshPalette[0]};--mesh-b:${meshPalette[1]};--mesh-c:${meshPalette[2]}`
-  $: sourceLabel = isVideoMode ? 'OFFICIAL VIDEO' : track?.source ? String(track.source).replace(/_/g, ' ').toUpperCase() : 'MY MUSIC'
   $: statusLabel = lyricsOpen ? (lyricsSynced ? 'SYNCED' : 'LYRICS') : isVideoMode ? 'VIDEO' : 'AUDIO'
   $: if (lyricsOpen && track?.videoId) {
     loadLyrics(track.videoId)
@@ -301,6 +317,19 @@
     if (typeof value === 'string' && value.includes(':')) return value
     const seconds = Number(value)
     return Number.isFinite(seconds) && seconds > 0 ? formatTime(seconds) : '—'
+  }
+
+  function lyricLineEnd(index, line) {
+    const next = Number(lyrics[index + 1]?.time)
+    if (Number.isFinite(next) && next > Number(line?.time)) return next
+    return Number(duration) > Number(line?.time) ? Number(duration) : Number(line?.time || 0) + 4
+  }
+
+  function lyricProgress(index, line) {
+    const start = Number(line?.time)
+    const end = lyricLineEnd(index, line)
+    if (!Number.isFinite(start) || end <= start) return 0
+    return Math.max(0, Math.min(1, (lyricClock() - start) / (end - start)))
   }
 
   function getHighResArt(url) {
@@ -324,9 +353,9 @@
     return getHighResArt(String(raw))
   }
 
-  async function loadArtistBackdrop(artistId, artistName, force = false) {
-    const key = `${artistId}|${artistName}`
-    if (!key.replace('|', '')) return
+  async function loadArtistBackdrop(trackId, artistId, artistName, force = false) {
+    const key = `${trackId}|${artistId}|${artistName}`
+    if (!key.replace(/\|/g, '')) return
     if (!force && key === backdropArtistKey) return
     backdropArtistKey = key
     clearTimeout(backdropRetryTimer)
@@ -334,18 +363,21 @@
     backdropLoopUrl = null
     artistBackdropUrl = null
     backdropVideoFailed = false
+    backdropVideoPlaying = false
     try {
       const params = new URLSearchParams()
+      if (trackId) params.set('trackId', trackId)
       if (artistId) params.set('artistId', artistId)
       if (artistName) params.set('artistName', artistName)
+      if (track?.title) params.set('title', clean(track.title))
       const response = await apiFetch(`/api/media/backdrop?${params.toString()}`)
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw Error(data.error || 'Backdrop unavailable')
       if (request !== backdropRequest) return
       backdropLoopUrl = data.loopUrl || null
       artistBackdropUrl = data.backdropUrl || null
-      if (!backdropLoopUrl && artistName && request === backdropRequest) {
-        backdropRetryTimer = setTimeout(() => loadArtistBackdrop(artistId, artistName, true), 8000)
+      if (!backdropLoopUrl && (trackId || artistName) && request === backdropRequest) {
+        backdropRetryTimer = setTimeout(() => loadArtistBackdrop(trackId, artistId, artistName, true), 8000)
       }
     } catch {
       if (request !== backdropRequest) return
@@ -359,6 +391,15 @@
   function handleBackdropVideoError() {
     backdropVideoFailed = true
     backdropLoopUrl = null
+  }
+
+  function handleBackdropVideoPlaying() {
+    backdropVideoPlaying = true
+  }
+
+  $: if (backdropVideoElement && backdropLoopUrl && !backdropVideoFailed) {
+    backdropVideoElement.load()
+    backdropVideoElement.play().catch(() => handleBackdropVideoError())
   }
 
   function sampleArtwork(event) {
@@ -524,6 +565,18 @@
     if (!id) return false
     videoLoading = true
     try {
+      // Prefer the short, muted Theatre loop. The backend starts generating it
+      // on the first request and returns the progressive stream as a fallback.
+      try {
+        const loopResponse = await apiFetch(`/api/media/backdrop?trackId=${encodeURIComponent(id)}`)
+        const loopData = await loopResponse.json().catch(() => ({}))
+        if (request !== videoRequest) return false
+        if (loopResponse.ok && loopData.loopUrl) {
+          videoUrl = loopData.loopUrl
+          return true
+        }
+      } catch { /* use the progressive companion stream below */ }
+
       const response = await apiFetch(`/api/video-url/${encodeURIComponent(id)}`)
       const data = await response.json()
       const resolvedUrl = data.stream_url || data.url
@@ -559,6 +612,11 @@
     videoPlaying = false
     videoErrorMessage = 'Playback blocked by the media server.'
     console.error('Video element playback error:', event?.currentTarget?.error || event)
+  }
+
+  function adjustVolume(delta) {
+    const next = Math.max(0, Math.min(1, Number(volume || 0) + Number(delta || 0)))
+    onVolume({ currentTarget: { value: String(next) } })
   }
 
   function videoTimeUpdated() {
@@ -695,6 +753,7 @@
   async function loadLyrics(id) {
     const request = ++lyricRequest
     lyrics = []
+    rawLyrics = []
     plainLyrics = ''
     lyricsSynced = false
     activeLyric = -1
@@ -952,16 +1011,18 @@
   on:pointermove={onPointerMove}
   on:pointerdown={() => wakeChrome()}
   on:touchstart={() => wakeChrome()}
+  on:wheel={(event) => adjustVolume(event.deltaY < 0 ? 0.05 : -0.05)}
   on:mouseleave={onPointerLeave}
 >
   <div class="mesh-backdrop" aria-hidden="true">
     {#if backdropLoopUrl && !backdropVideoFailed}
-      <video bind:this={backdropVideoElement} class="media-backdrop" src={backdropLoopUrl} autoplay loop muted playsinline preload="auto" on:error={handleBackdropVideoError}><track kind="captions" /></video>
-    {:else if artistBackdropUrl}
-      <img class="media-backdrop" src={artistBackdropUrl} referrerpolicy="no-referrer" alt="" />
+      <video bind:this={backdropVideoElement} class:video-ready={backdropVideoPlaying} class="backdrop-media" src={backdropLoopUrl} autoplay loop muted playsinline preload="auto" on:playing={handleBackdropVideoPlaying} on:error={handleBackdropVideoError}><track kind="captions" /></video>
+    {:else if artistBackdropUrl || instantVideoBackdrop}
+      <img class="backdrop-media" src={artistBackdropUrl || instantVideoBackdrop} referrerpolicy="no-referrer" alt="" />
     {:else if artUrl}
-      <img class="media-backdrop artwork-fallback" src={artUrl} referrerpolicy="no-referrer" alt="" />
+      <img class="backdrop-media artwork-fallback" src={artUrl} referrerpolicy="no-referrer" alt="" />
     {/if}
+    <div class="dark-overlay"></div>
     <div class="mesh-orb orb-a"></div><div class="mesh-orb orb-b"></div><div class="mesh-orb orb-c"></div><div class="grain"></div>
   </div>
 
@@ -970,7 +1031,7 @@
       <button class="round-button close-button" on:pointerdown|preventDefault={onClose} aria-label="Close Theatre Mode" title="Close Theatre Mode">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg>
       </button>
-      <div class="source-label"><span class="source-dot" class:video-dot={isVideoMode}></span>{sourceLabel}</div>
+          <div class="source-label"><span class="source-dot" class:video-dot={isVideoMode}></span></div>
       <div class="topbar-spacer" aria-hidden="true"></div>
     </header>
 
@@ -978,13 +1039,14 @@
       {#if lyricsOpen}
       {#if isVideoMode}
         <div class="lyrics-video-backdrop" aria-hidden="true">
-          <video bind:this={videoElement} src={videoUrl} playsinline preload="auto" autoplay class="backdrop-video" on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:error={videoPlaybackError}><track kind="captions" /></video>
+          <video bind:this={videoElement} src={videoUrl} playsinline muted autoplay loop preload="auto" class="backdrop-video" on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:error={videoPlaybackError}><track kind="captions" /></video>
           <div class="backdrop-shade"></div>
         </div>
       {/if}
+        <div class="lyrics-scrim">
         <section class="lyrics-stage" aria-label="Synchronized lyrics">
           <div class="lyrics-heading">
-            <div class="lyrics-title"><span>{clean(track?.title) || 'Lyrics'}</span><span class="micro-badge">{statusLabel}</span></div>
+            <div class="lyrics-title"><span>{clean(track?.title) || 'Lyrics'}</span></div>
             <div class="offset-controls" aria-label="Lyric timing offset">
               {#if isVideoMode}<button type="button" on:pointerdown|preventDefault={() => adjustOffset(-0.5)} aria-label="Shift video lyrics earlier by 0.5 seconds">−0.5s</button>{:else}<button type="button" on:pointerdown|preventDefault={() => adjustOffset(-0.2)} aria-label="Shift lyrics earlier by 0.2 seconds">−0.2s</button>{/if}
               <span>{isVideoMode ? `Offset ${videoOffset >= 0 ? '+' : ''}${videoOffset.toFixed(1)}s` : (manualOffset >= 0 ? `+${manualOffset.toFixed(1)}s` : `${manualOffset.toFixed(1)}s`)}</span>
@@ -997,8 +1059,8 @@
           {:else if lyrics.length}
             <div class="lyrics-scroll" bind:this={lyricsContainer}>
               {#each lyrics as line, index}
-                <button class:active={index === activeLyric} class:intro-line={line.isIntro} class:prompt-line={line.isPrompt} class="lyric-line" on:click={() => line.isPrompt ? syncBeat() : seekLine(Number(line.time))}>
-                  <span>{line.text}</span>
+                <button class:active={index === activeLyric} class:intro-line={line.isIntro} class:prompt-line={line.isPrompt} class="lyric-line" style={`--progress:${lyricProgress(index, line) * 100}%;`} on:click={() => line.isPrompt ? syncBeat() : seekLine(Number(line.time))}>
+                  <span class="lyric-text">{line.text}</span>
                   {#if line.isIntro && playbackTime < Number(line.duration)}<small>Track starts in {formatTime(Math.max(0, Number(line.duration) - playbackTime))}</small>{/if}
                   {#if line.isPrompt}<small>Tap here when the beat drops · press S</small>{/if}
                 </button>
@@ -1010,6 +1072,7 @@
             <div class="lyrics-empty">{videoLoading || karaokeLoading ? 'Preparing lyrics…' : 'Lyrics unavailable for this track.'}</div>
           {/if}
         </section>
+        </div>
       {:else}
         <section class="center-stage" aria-label="Now playing">
           <div class:video-wrap={isVideoMode} class="stage-frame-wrap">
@@ -1017,7 +1080,7 @@
             <div class:video-frame={isVideoMode} class:tilt-reset={!tiltActive || isVideoMode} class="art-frame" style={tiltStyle}>
               {#if isVideoMode && companionVideoId}
                 <div class="native-video-shell">
-                  <video bind:this={videoElement} class="native-video" src={videoUrl} playsinline preload="auto" autoplay on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:seeking={videoTimeUpdated} on:error={videoPlaybackError} on:ended={onNext} on:pointerdown|stopPropagation|preventDefault={togglePlayback} aria-label="Video for {clean(track?.title)}"><track kind="captions" /></video>
+                  <video bind:this={videoElement} class="native-video" src={videoUrl} playsinline muted autoplay loop preload="auto" on:loadedmetadata={videoMetadataLoaded} on:play={videoPlayed} on:pause={videoPaused} on:timeupdate={videoTimeUpdated} on:seeking={videoTimeUpdated} on:error={videoPlaybackError} on:ended={onNext} on:pointerdown|stopPropagation|preventDefault={togglePlayback} aria-label="Video for {clean(track?.title)}"><track kind="captions" /></video>
                   {#if videoLoading}<div class="video-message"><span></span>Resolving video stream…</div>{:else if videoErrorMessage}<div class="video-message error"><strong>Could not load video</strong><small>{videoErrorMessage}</small></div>{:else if !videoUrl}<div class="video-message error">Video unavailable for this track.</div>{/if}
                 </div>
                 <button class="video-exit" on:pointerdown|preventDefault={() => exitVideoMode(true)} aria-label="Return to album artwork"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6" /></svg><span>Artwork</span></button>
@@ -1037,7 +1100,7 @@
             <h1>{clean(track?.title) || 'No Track Selected'}</h1>
             <p>{clean(track?.artist) || 'Unknown Artist'}</p>
             {#if track?.requested_by}<div class="requested-by">Requested by {clean(track.requested_by)}</div>{/if}
-            <div class="metadata-subline"><span class="micro-badge">{statusLabel}</span>{#if clean(track?.album)}<span>{clean(track.album)}</span>{/if}</div>
+            <div class="metadata-subline">{#if clean(track?.album)}<span>{clean(track.album)}</span>{/if}</div>
           </section>
         </section>
       {/if}
@@ -1049,7 +1112,7 @@
         <input type="range" min="0" max={playbackDuration || 0} value={playbackTime} step=".1" on:change={handleSeek} aria-label="Seek through track" />
         <span>{formatTime(playbackDuration)}</span>
       </div>
-      <div class="dock-controls">
+      <div class="dock-controls"><span class="telemetry">OPUS · 160kbps · 48kHz</span>
         <div class="transport-group secondary-left">
           <button class:active={shuffle} class="icon-button" on:pointerdown|preventDefault={onShuffle} aria-label="Toggle shuffle" title="Shuffle"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h3c4.6 0 5.4 10 10 10h3M17 4h3v3M20 4l-4 4M4 17h3c1.2 0 2.1-.5 2.9-1.3M17 14h3v3M20 20l-4-4" /></svg></button>
           <button class:active={repeat !== 'off'} class="icon-button" on:pointerdown|preventDefault={onRepeat} aria-label={`Repeat ${repeat}`} title={`Repeat ${repeat}`}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 2l4 4-4 4M3 11V9a3 3 0 0 1 3-3h15M7 22l-4-4 4-4M21 13v2a3 3 0 0 1-3 3H3" />{#if repeat === 'one'}<circle cx="12" cy="12" r="2" />{/if}</svg></button>
@@ -1060,14 +1123,18 @@
           <button class="skip-button" on:pointerdown|preventDefault={onNext} aria-label="Next track" title="Next track"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l8 6-8 6zM18 5v14" /></svg></button>
         </div>
         <div class="transport-group secondary-right">
-          <button class="party-pill" class:live={party} on:click={() => { wakeChrome(); onPartyOpen() }} aria-label={party ? 'Party guests and invites' : 'Start a party room'} title={party ? 'Party Mode' : 'Start Party Mode'}>
-            <span class="party-dot" aria-hidden="true"></span>
-            <span>{party ? `${connectedGuests.length} connected` : 'Party'}</span>
-            {#if pendingCount}<b class="party-pending">{pendingCount}</b>{/if}
-          </button>
-          <button class="text-pill" on:pointerdown|preventDefault={openPlaylistPicker} aria-label="Add current track to a playlist" title="Add to Playlist"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg><span>Add to Playlist</span></button>
-          <button class:active={lyricsOpen} class="text-pill" on:pointerdown|preventDefault={toggleLyrics} aria-label="Toggle synced lyrics" title="Toggle synced lyrics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zm5 9a5 5 0 0 1-10 0M12 17v4M8 21h8" /></svg><span>Lyrics</span></button>
-          <button class:active={queueOpen} class="text-pill" on:pointerdown|preventDefault={onQueue} aria-label="Toggle playback queue" title="Toggle playback queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg><span>Queue</span>{#if upNext.length}<b>{upNext.length}</b>{/if}</button>
+          {#if isVideoMode}<button class="icon-button active" on:pointerdown|preventDefault={() => exitVideoMode(true)} aria-label="Return to artwork" title="Return to artwork"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m10 9 5 3-5 3z" /></svg></button>{:else if hasVideo && companionVideoId}<button class="icon-button" on:pointerdown|preventDefault={toggleVideo} aria-label="Play companion video" title="Play video"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m10 9 5 3-5 3z" /></svg></button>{/if}
+          <button class:active={lyricsOpen} class="icon-button" on:pointerdown|preventDefault={toggleLyrics} aria-label="Toggle synced lyrics" title="Lyrics"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zm5 9a5 5 0 0 1-10 0M12 17v4M8 21h8" /></svg></button>
+          <button class:active={queueOpen} class="icon-button queue-button" on:pointerdown|preventDefault={onQueue} aria-label="Toggle playback queue" title="Queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10" /></svg>{#if upNext.length}<b>{upNext.length}</b>{/if}</button>
+          <label class="theatre-volume" aria-label="Volume" title="Volume"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4h4l5 4V6l-5 4H4zM16 8a6 6 0 0 1 0 8M19 5a10 10 0 0 1 0 14" /></svg><input type="range" min="0" max="1" step=".01" value={volume} on:input={onVolume} /></label>
+          <div class="dock-more">
+            <button class="icon-button more-button" class:active={dockMoreOpen} on:pointerdown|preventDefault={() => dockMoreOpen = !dockMoreOpen} aria-label="More player actions" aria-expanded={dockMoreOpen} title="More actions">···</button>
+            {#if dockMoreOpen}<div class="dock-menu" role="menu">
+              <button role="menuitem" on:click={() => { dockMoreOpen = false; onPartyOpen() }}>Party Mode</button>
+              <button role="menuitem" on:click={() => { dockMoreOpen = false; openPlaylistPicker() }}>Add to Playlist</button>
+              <button role="menuitem" on:click={() => { dockMoreOpen = false; onSleepTimer(30) }}>Sleep Timer · 30m</button>
+            </div>{/if}
+          </div>
         </div>
       </div>
     </footer>
@@ -1106,7 +1173,7 @@
           <button class="round-button" on:pointerdown|preventDefault={() => onPartyOpen()} aria-label="Close party controls"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
         </header>
         {#if party.qrDataUrl}
-          <div class="party-qr"><img src={`https://api.qrserver.com/v1/create-qr-code/?size=168x168&data=${encodeURIComponent(party.invite_url || party.inviteUrl || '')}`} alt="Party QR Code" /></div>
+          <div class="party-qr"><canvas use:renderQr={party.invite_url || party.inviteUrl || ''} aria-label="Party QR Code"></canvas></div>
         {/if}
         {#if pendingCount}
           <div class="party-request-banner" role="status">
@@ -1239,9 +1306,10 @@
   .theatre { position:fixed; inset:0; z-index:100; width:100vw; height:100vh; overflow:hidden; color:#fff; background:#080808; font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif; user-select:none; cursor:default; isolation:isolate; }
   .theatre.cinema-hidden { cursor:none; }
   .mesh-backdrop { position:absolute; inset:0; z-index:-2; overflow:hidden; background:#080808; }
-  .media-backdrop { position:absolute; inset:-3%; z-index:0; width:106%; height:106%; object-fit:cover; opacity:.56; filter:brightness(.34) saturate(.82); transform:scale(1.03); transition:opacity .35s ease; }
-  .media-backdrop.artwork-fallback { opacity:.28; filter:brightness(.24) saturate(.65); }
-  .mesh-backdrop::after { content:''; position:absolute; inset:0; z-index:3; background:radial-gradient(ellipse at center,transparent 20%,#080808b8 78%,#080808f2 100%),linear-gradient(180deg,#080808aa 0%,#08080835 46%,#080808e8 100%); pointer-events:none; }
+  .backdrop-media { position:absolute; inset:0; z-index:0; width:100vw; height:100vh; object-fit:cover; object-position:center; opacity:.88; transform:scale(1.01); transition:opacity .35s ease; }
+  .backdrop-media.artwork-fallback { opacity:.42; }
+  .backdrop-media.video-ready { opacity:1; }
+  .dark-overlay { position:absolute; inset:0; z-index:2; background:radial-gradient(circle at center,rgba(0,0,0,.15) 20%,rgba(0,0,0,.6) 100%),linear-gradient(to top,rgba(0,0,0,.85) 0%,transparent 28%),linear-gradient(to bottom,rgba(0,0,0,.7) 0%,transparent 18%); pointer-events:none; }
   .mesh-orb { position:absolute; width:72vw; height:72vw; max-width:980px; max-height:980px; border-radius:50%; opacity:.42; filter:blur(110px); mix-blend-mode:screen; will-change:transform; animation:mesh-drift 24s ease-in-out infinite alternate; }
   .orb-a { top:-30%; left:-16%; background:radial-gradient(circle,var(--mesh-a),transparent 68%); }
   .orb-b { top:7%; right:-27%; background:radial-gradient(circle,var(--mesh-b),transparent 68%); animation-delay:-8s; animation-duration:29s; }
@@ -1251,24 +1319,24 @@
 
   .theatre-content { position:relative; display:flex; flex-direction:column; width:100%; height:100%; min-height:0; box-sizing:border-box; padding:1.5rem 2rem 7.5rem; }
   .theatre-topbar { display:flex; flex:0 0 44px; align-items:center; justify-content:space-between; width:100%; z-index:20; transition:opacity .2s ease; }.theatre-topbar.chrome-hidden,.bottom-dock.chrome-hidden { opacity:0; pointer-events:none; }
-  .round-button { display:grid; place-items:center; width:38px; height:38px; border:1px solid #ffffff1c; border-radius:50%; color:#ffffffb5; background:#ffffff0b; cursor:pointer; backdrop-filter:blur(18px); transition:transform .2s ease,background .2s ease,color .2s ease; }.round-button:hover { color:#fff; background:#ffffff19; transform:scale(1.05); }.round-button svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.close-button svg { width:19px; height:19px; }.source-label { display:flex; align-items:center; gap:.5rem; color:#ffffffa8; font-size:.62rem; font-weight:700; letter-spacing:.18em; }.source-dot { width:5px; height:5px; border-radius:50%; background:#a78bfa; box-shadow:0 0 12px #a78bfa; }.source-dot.video-dot { background:#34d399; box-shadow:0 0 12px #34d399; }.topbar-spacer { width:38px; }
+  .round-button { display:grid; place-items:center; width:38px; height:38px; border:1px solid #ffffff1c; border-radius:50%; color:#ffffffb5; background:#ffffff0b; cursor:pointer; backdrop-filter:blur(18px); transition:transform .2s ease,background .2s ease,color .2s ease; }.round-button:hover { color:#fff; background:#ffffff19; transform:scale(1.05); }.round-button svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.close-button svg { width:19px; height:19px; }  .source-label { display:flex; align-items:center; gap:.5rem; color:#ffffffa8; font-size:.62rem; font-weight:700; letter-spacing:.18em; text-shadow:0 2px 12px rgba(0,0,0,.85); }.source-dot { width:5px; height:5px; border-radius:50%; background:#a78bfa; box-shadow:0 0 12px #a78bfa; }.source-dot.video-dot { background:#34d399; box-shadow:0 0 12px #34d399; }.topbar-spacer { width:38px; }
 
   .theatre-main { position:relative; display:flex; flex:1 1 auto; min-height:0; align-items:center; justify-content:center; margin:.5rem 0; z-index:2; }.center-stage { display:flex; flex-direction:column; align-items:center; justify-content:center; width:min(100%,1180px); min-height:0; }.stage-frame-wrap { position:relative; display:grid; place-items:center; width:min(62vh,430px); max-width:100%; aspect-ratio:1; transition:width .45s ease,aspect-ratio .45s ease; }.stage-frame-wrap.video-wrap { width:min(100%,1080px); height:min(58vh,608px); aspect-ratio:16 / 9; }.viz-canvas { position:absolute; inset:-16%; width:132%; height:132%; pointer-events:none; opacity:.72; }
   .art-frame { position:relative; z-index:1; width:min(100%,430px); aspect-ratio:1; overflow:hidden; border:1px solid #ffffff1a; border-radius:30px; background:#0b0b0d; box-shadow:0 30px 90px #000b,0 0 60px #0008; transform-style:preserve-3d; transition:transform .55s cubic-bezier(.2,.8,.2,1),width .45s ease,height .45s ease,border-radius .45s ease; }.art-frame.video-frame { width:100%; height:100%; max-width:1080px; aspect-ratio:16 / 9; border-radius:24px; }.art-frame.tilt-reset { transition:transform .65s cubic-bezier(.2,.8,.2,1); }.art,.native-video { display:block; width:100%; height:100%; object-fit:cover; }.native-video { position:absolute; inset:0; object-fit:contain; background:#000; cursor:pointer; }.placeholder { display:grid; place-items:center; color:#fff; background:linear-gradient(135deg,#252331,#4d3640); font-size:7rem; }
   .art-button { position:relative; display:block; width:100%; height:100%; padding:0; border:0; color:inherit; background:none; cursor:pointer; }.art-button:disabled { cursor:default; }.art-button:focus-visible,.queue-item:focus-visible,.text-pill:focus-visible,.icon-button:focus-visible,.skip-button:focus-visible,.play-button:focus-visible { outline:2px solid #fff; outline-offset:4px; }.art-hint { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:.55rem; color:#fff; background:#0008; opacity:0; transition:opacity .25s ease; }.art-button:hover .art-hint,.art-button:focus-visible .art-hint { opacity:1; }.art-hint svg { width:45px; height:45px; padding:13px; border:1px solid #ffffff55; border-radius:50%; fill:currentColor; }.art-hint span { padding:.3rem .65rem; border-radius:999px; background:#000a; font-size:.68rem; font-weight:700; }
   .native-video-shell { position:absolute; inset:0; display:grid; place-items:center; background:#000; }.video-message { position:relative; z-index:2; display:flex; align-items:center; gap:.55rem; color:#ffffffb8; font-size:.75rem; }.video-message > span { width:.45rem; height:.45rem; border-radius:50%; background:#34d399; box-shadow:0 0 12px #34d399; animation:pulse 1s ease-in-out infinite alternate; }.video-message.error { flex-direction:column; max-width:80%; color:#ffffff99; text-align:center; }.video-message.error strong { color:#fca5a5; }.video-message small { overflow-wrap:anywhere; }@keyframes pulse { to { opacity:.3; transform:scale(.7); } }.video-exit { position:absolute; top:1rem; left:1rem; z-index:4; display:flex; align-items:center; gap:.35rem; padding:.5rem .8rem; border:1px solid #ffffff1a; border-radius:999px; color:#ffffffd9; background:#0009; cursor:pointer; font-size:.72rem; opacity:0; backdrop-filter:blur(16px); transition:opacity .25s ease,background .2s ease; }.art-frame.video-frame:hover .video-exit,.video-exit:focus-visible { opacity:1; }.video-exit:hover { background:#000; }.video-exit svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
-  .metadata { width:min(100%,600px); margin-top:1.25rem; text-align:center; }.requested-by { display:inline-flex; margin-top:.6rem; padding:.28rem .55rem; border:1px solid #ffffff18; border-radius:999px; color:#ffffff9c; background:#ffffff0a; font-size:.64rem; font-weight:650; }.metadata h1 { margin:0; overflow:hidden; color:#fff; font-size:clamp(1.5rem,3vw,2.15rem); font-weight:750; letter-spacing:-.035em; line-height:1.12; text-overflow:ellipsis; white-space:nowrap; }.metadata p { margin:.42rem 0 0; color:#ffffff99; font-size:clamp(.86rem,1.5vw,1rem); font-weight:500; }.metadata-subline { display:flex; align-items:center; justify-content:center; gap:.55rem; margin-top:.65rem; color:#ffffff58; font-size:.7rem; }.micro-badge { display:inline-flex; align-items:center; padding:.2rem .45rem; border-radius:5px; color:#ffffff9c; background:#ffffff10; font:700 .56rem/1 Inter,ui-sans-serif,sans-serif; letter-spacing:.12em; }
+  .metadata { width:min(100%,600px); margin-top:1.25rem; text-align:center; }.requested-by { display:inline-flex; margin-top:.6rem; padding:.28rem .55rem; border:1px solid #ffffff18; border-radius:999px; color:#ffffff9c; background:#ffffff0a; font-size:.64rem; font-weight:650; }  .metadata h1 { margin:0; overflow:hidden; color:#fff; font-size:clamp(1.5rem,3vw,2.15rem); font-weight:750; letter-spacing:-.035em; line-height:1.12; text-overflow:ellipsis; white-space:nowrap; text-shadow:0 2px 12px rgba(0,0,0,.85); }.metadata p { margin:.42rem 0 0; color:#ffffff99; font-size:clamp(.86rem,1.5vw,1rem); font-weight:500; text-shadow:0 2px 12px rgba(0,0,0,.85); }.metadata-subline { display:flex; align-items:center; justify-content:center; gap:.55rem; margin-top:.65rem; color:#ffffff58; font-size:.7rem; }  .micro-badge { display:inline-flex; align-items:center; padding:.2rem .45rem; border-radius:5px; color:#ffffff9c; background:#ffffff10; font:700 .56rem/1 Inter,ui-sans-serif,sans-serif; letter-spacing:.12em; text-shadow:0 2px 12px rgba(0,0,0,.85); }
 
-  .bottom-dock { position:fixed; left:50%; bottom:1.5rem; z-index:40; display:flex; flex-direction:column; gap:.75rem; width:92%; max-width:900px; padding:.85rem 1.25rem .8rem; border:1px solid #ffffff16; border-radius:28px; background:#0c0c0cc7; box-shadow:0 24px 70px #000b; backdrop-filter:blur(28px) saturate(1.2); transform:translateX(-50%); transition:opacity .2s ease; }.dock-scrubber { display:flex; align-items:center; gap:.7rem; color:#ffffff72; font:500 .68rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums; }.dock-scrubber input { flex:1; min-width:0; height:4px; accent-color:#fff; cursor:pointer; transition:height .15s ease; }.dock-scrubber input:hover { height:7px; }.dock-controls { display:flex; align-items:center; justify-content:space-between; gap:1rem; }.transport-group { display:flex; align-items:center; gap:.45rem; }.secondary-left,.secondary-right { flex:1; }.secondary-right { justify-content:flex-end; }.icon-button,.skip-button,.play-button,.text-pill { display:inline-flex; align-items:center; justify-content:center; border:0; cursor:pointer; transition:transform .18s ease,background .18s ease,color .18s ease,box-shadow .18s ease; }.icon-button { width:34px; height:34px; border:1px solid transparent; border-radius:50%; color:#ffffff76; background:transparent; }.icon-button:hover,.icon-button.active { color:#fff; background:#ffffff10; }.icon-button svg,.skip-button svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.icon-button:nth-child(2) svg circle { fill:none; }.skip-button { width:38px; height:38px; border:1px solid #ffffff12; border-radius:50%; color:#fff; background:#ffffff08; }.skip-button:hover { background:#ffffff18; transform:scale(1.05); }.play-button { width:54px; height:54px; border-radius:50%; color:#090909; background:#fff; box-shadow:0 10px 28px #0009; }.play-button:hover { transform:scale(1.06); box-shadow:0 14px 34px #000c; }.play-button:active,.skip-button:active,.icon-button:active,.text-pill:active { transform:scale(.94); }.play-button svg { width:21px; height:21px; fill:currentColor; }.text-pill { gap:.42rem; min-height:34px; padding:.45rem .75rem; border:1px solid #ffffff14; border-radius:999px; color:#ffffffa3; background:#ffffff08; font-size:.7rem; font-weight:600; }.text-pill:hover { color:#fff; background:#ffffff15; }.text-pill.active { color:#111; border-color:#fff; background:#fff; }.text-pill svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.text-pill b { min-width:1.35em; padding:.12rem .3rem; border-radius:999px; color:#fff; background:#ffffff16; font-size:.58rem; text-align:center; }.text-pill.active b { color:#111; background:#0002; }
+  .bottom-dock { position:fixed; left:50%; bottom:1.5rem; z-index:40; display:flex; flex-direction:column; gap:.75rem; width:92%; max-width:900px; padding:.85rem 1.25rem .8rem; border:1px solid #ffffff16; border-radius:28px; background:#0c0c0cc7; box-shadow:0 24px 70px #000b; backdrop-filter:blur(28px) saturate(1.2); transform:translateX(-50%); transition:opacity .2s ease; }.dock-scrubber { display:flex; align-items:center; gap:.7rem; color:#ffffff72; font:500 .68rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums; }.dock-scrubber input { flex:1; min-width:0; height:4px; accent-color:#fff; cursor:pointer; transition:height .15s ease; }.dock-scrubber input:hover { height:7px; }  .telemetry { position:absolute; right:1.25rem; bottom:.42rem; color:#ffffff4f; font:500 .56rem ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.04em; pointer-events:none; } .dock-controls { display:flex; align-items:center; justify-content:space-between; gap:1rem; }.transport-group { display:flex; align-items:center; gap:.45rem; }.secondary-left,.secondary-right { flex:1; }.secondary-right { justify-content:flex-end; }.icon-button,.skip-button,.play-button,.text-pill { display:inline-flex; align-items:center; justify-content:center; border:0; cursor:pointer; transition:transform .18s ease,background .18s ease,color .18s ease,box-shadow .18s ease; }.icon-button { width:34px; height:34px; border:1px solid transparent; border-radius:50%; color:#ffffff76; background:transparent; }.icon-button:hover,.icon-button.active { color:#fff; background:#ffffff10; }  .icon-button svg,.skip-button svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.theatre-volume { display:flex; align-items:center; gap:.4rem; color:#ffffff70; }.theatre-volume svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.theatre-volume input { width:72px; accent-color:#fff; cursor:pointer; }.icon-button:nth-child(2) svg circle { fill:none; }.skip-button { width:38px; height:38px; border:1px solid #ffffff12; border-radius:50%; color:#fff; background:#ffffff08; }.skip-button:hover { background:#ffffff18; transform:scale(1.05); }.play-button { width:54px; height:54px; border-radius:50%; color:#090909; background:#fff; box-shadow:0 10px 28px #0009; }.play-button:hover { transform:scale(1.06); box-shadow:0 14px 34px #000c; }.play-button:active,.skip-button:active,.icon-button:active,.text-pill:active { transform:scale(.94); }.play-button svg { width:21px; height:21px; fill:currentColor; }.text-pill { gap:.42rem; min-height:34px; padding:.45rem .75rem; border:1px solid #ffffff14; border-radius:999px; color:#ffffffa3; background:#ffffff08; font-size:.7rem; font-weight:600; }.text-pill:hover { color:#fff; background:#ffffff15; }.text-pill.active { color:#111; border-color:#fff; background:#fff; }.text-pill svg { width:14px; height:14px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }.text-pill b { min-width:1.35em; padding:.12rem .3rem; border-radius:999px; color:#fff; background:#ffffff16; font-size:.58rem; text-align:center; }.text-pill.active b { color:#111; background:#0002; }
 
-  .lyrics-video-backdrop { position:absolute; inset:-2rem; z-index:0; overflow:hidden; }.backdrop-video { width:100%; height:100%; object-fit:cover; transform:scale(1.08); filter:blur(18px) brightness(.3) saturate(.85); }.backdrop-shade { position:absolute; inset:0; background:linear-gradient(180deg,#000b 0%,#0003 45%,#000e 100%); }.lyrics-stage { position:relative; z-index:1; display:flex; flex-direction:column; width:min(100%,820px); height:100%; min-height:0; overflow:hidden; pointer-events:none; }.lyrics-heading { display:flex; flex:0 0 auto; align-items:center; justify-content:space-between; gap:1rem; padding:0 .7rem; color:#fff; }.lyrics-title { display:flex; align-items:center; gap:.55rem; min-width:0; }.lyrics-title > span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#ffffffcf; font-size:.8rem; font-weight:650; }.offset-controls { display:flex; align-items:center; gap:.1rem; pointer-events:auto; color:#ffffff72; font:500 .62rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; }.offset-controls button { border:0; padding:.28rem .38rem; border-radius:5px; color:#ffffff8d; background:transparent; cursor:pointer; font:inherit; }.offset-controls button:hover { color:#fff; background:#ffffff12; }.offset-controls span { min-width:2.8em; color:#ffffffbc; text-align:center; font-variant-numeric:tabular-nums; }.lyrics-scroll { flex:1; min-height:0; overflow-y:auto; padding:34vh 1rem 30vh; scrollbar-width:none; mask-image:linear-gradient(to bottom,transparent 0%,black 15%,black 85%,transparent 100%); pointer-events:auto; }.lyrics-scroll::-webkit-scrollbar { display:none; }.lyric-line { display:block; width:100%; padding:.62rem 0; border:0; color:#fff; background:none; text-align:center; font-size:clamp(1.45rem,3.4vw,2.8rem); font-weight:650; letter-spacing:-.035em; line-height:1.25; opacity:.3; filter:blur(1.5px); transform:scale(.95); cursor:pointer; transition:opacity .3s ease,filter .3s ease,transform .3s ease,color .3s ease; }  .lyric-line small { display:block; margin-top:.45rem; color:#ffffff58; font:500 .62rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:0; }
+  .lyrics-video-backdrop { position:absolute; inset:-2rem; z-index:0; overflow:hidden; }  .backdrop-video { width:100%; height:100%; object-fit:cover; transform:scale(1.08); }.backdrop-shade { position:absolute; inset:0; background:linear-gradient(180deg,#000b 0%,#0003 45%,#000e 100%); }.lyrics-scrim { position:absolute; inset:0; z-index:1; display:flex; align-items:center; justify-content:flex-start; overflow:hidden; background:linear-gradient(90deg,rgba(0,0,0,.85) 0%,rgba(0,0,0,.6) 50%,rgba(0,0,0,0) 100%); backdrop-filter:blur(8px); }.lyrics-stage { position:relative; z-index:1; display:flex; flex-direction:column; width:min(100%,820px); height:100%; min-height:0; overflow:hidden; pointer-events:none; }.lyrics-heading { display:flex; flex:0 0 auto; align-items:center; justify-content:space-between; gap:1rem; padding:0 .7rem; color:#fff; }.lyrics-title { display:flex; align-items:center; gap:.55rem; min-width:0; }.lyrics-title > span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#ffffffcf; font-size:.8rem; font-weight:650; }.offset-controls { display:flex; align-items:center; gap:.1rem; pointer-events:auto; color:#ffffff72; font:500 .62rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; }.offset-controls button { border:0; padding:.28rem .38rem; border-radius:5px; color:#ffffff8d; background:transparent; cursor:pointer; font:inherit; }.offset-controls button:hover { color:#fff; background:#ffffff12; }.offset-controls span { min-width:2.8em; color:#ffffffbc; text-align:center; font-variant-numeric:tabular-nums; }.lyrics-scroll { flex:1; min-height:0; overflow-y:auto; padding:34vh 1rem 30vh; scrollbar-width:none; mask-image:linear-gradient(to bottom,transparent 0%,black 15%,black 85%,transparent 100%); pointer-events:auto; }.lyrics-scroll::-webkit-scrollbar { display:none; }  .lyric-line { display:block; width:100%; padding:.62rem 0; border:0; color:#fff; background:none; text-align:center; font-size:1.8rem; font-weight:600; letter-spacing:-.035em; line-height:1.4; opacity:.25; filter:blur(.5px); transform:scale(.96); cursor:pointer; transition:all .35s cubic-bezier(.2,0,0,1); text-shadow:0 2px 12px rgba(0,0,0,.9); }.lyric-line.active { opacity:1; filter:blur(0); transform:scale(1.05); font-size:2.25rem; font-weight:800; line-height:1.35; }.lyric-text { display:inline; background:linear-gradient(to right,#fff var(--progress),rgba(255,255,255,.35) var(--progress)); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }.lyric-line small { display:block; margin-top:.45rem; color:#ffffff58; font:500 .62rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:0; }
   .lyric-line.intro-line { opacity:.9; color:#ffffffd4; animation:intro-breathe 2.2s ease-in-out infinite alternate; }
   .lyric-line.prompt-line { padding:.8rem 1rem; border:1px solid #ffffff2c; border-radius:14px; background:#ffffff10; opacity:.95; animation:prompt-pulse 1.7s ease-in-out infinite alternate; }
   .lyric-line.prompt-line:hover { background:#ffffff18; }
   @keyframes intro-breathe { from { opacity:.68; } to { opacity:1; } }
   @keyframes prompt-pulse { from { box-shadow:0 0 0 #ffffff00; } to { box-shadow:0 0 28px #ffffff18; } }
   .sync-toast { position:fixed; top:5.5rem; left:50%; z-index:4; padding:.5rem .75rem; border:1px solid #ffffff1a; border-radius:999px; color:#fff; background:#0c0c0cd9; box-shadow:0 12px 28px #0008; transform:translateX(-50%); font-size:.7rem; font-weight:650; backdrop-filter:blur(18px); }
-  .plain-lyrics { flex:1; min-height:0; overflow:auto; padding:2rem 1rem 8rem; color:#ffffffc4; text-align:center; white-space:pre-wrap; font-size:clamp(1.2rem,2.4vw,2rem); line-height:1.6; pointer-events:auto; }.lyrics-empty { display:grid; flex:1; min-height:0; place-items:center; color:#ffffff99; text-align:center; }.lyrics-fullscreen .lyrics-stage { width:min(100%,1040px); }.lyrics-fullscreen .lyrics-scroll { padding-top:36vh; }
+  .plain-lyrics { flex:1; min-height:0; overflow:auto; padding:2rem 1rem 8rem; color:#ffffffc4; text-align:center; white-space:pre-wrap; font-size:clamp(1.2rem,2.4vw,2rem); line-height:1.6; pointer-events:auto; }.lyrics-scrim :global(.karaoke-line) { font-size:1.75rem; font-weight:600; line-height:1.4; opacity:.28; filter:blur(.6px); transform:scale(.96); transition:all .35s cubic-bezier(.2,0,0,1); text-shadow:0 2px 12px rgba(0,0,0,.9); }.lyrics-scrim :global(.karaoke-line.active) { opacity:1; filter:blur(0); transform:scale(1.05); font-size:2.25rem; font-weight:800; line-height:1.35; }.lyrics-scrim :global(.karaoke-word) { display:inline-block; margin-right:.32em; color:rgba(255,255,255,.45); transition:transform .18s cubic-bezier(.34,1.56,.64,1),color .12s ease,text-shadow .12s ease; }.lyrics-scrim :global(.karaoke-word.past) { color:#fff; }.lyrics-scrim :global(.karaoke-word.current) { color:#fff; text-shadow:0 0 20px rgba(255,255,255,.85),0 2px 12px rgba(0,0,0,.9); transform:scale(1.08) translateY(-2px); }.lyrics-empty { display:grid; flex:1; min-height:0; place-items:center; color:#ffffff99; text-align:center; }.lyrics-fullscreen .lyrics-stage { width:min(100%,1040px); }.lyrics-fullscreen .lyrics-scroll { padding-top:36vh; }
 
   .theatre.queue-visible .theatre-main { transform:translateX(-12%) scale(.92); transition:transform .3s ease-out; transform-origin:center center; }
   .queue-overlay { position:fixed; inset:0; z-index:50; background:#0006; backdrop-filter:blur(3px); animation:overlay-in .25s ease; }
@@ -1320,6 +1388,8 @@
   .party-launch { width:100%; padding:.7rem; border:1px solid #ffffff20; border-radius:12px; color:#090909; background:#fff; cursor:pointer; font-size:.75rem; font-weight:750; transition:transform .18s ease,background .18s ease; }.party-launch:hover { background:#f2f2f2; transform:translateY(-1px); }
   .party-live-label { display:block; margin-top:.35rem; color:#34d399b8; font-size:.65rem; }
   .party-request-banner { display:flex; align-items:center; justify-content:space-between; gap:.75rem; padding:.65rem .7rem; border:1px solid #fbbf2430; border-radius:12px; background:#fbbf240c; }.party-request-banner > div { display:flex; min-width:0; flex-direction:column; gap:.25rem; }.party-request-banner strong { color:#fde68a; font-size:.68rem; }.party-request-banner small { overflow:hidden; color:#ffffff80; font-size:.62rem; text-overflow:ellipsis; white-space:nowrap; }.party-request-banner > span { display:flex; flex:0 0 auto; gap:.3rem; }.party-request-banner button { padding:.38rem .52rem; border:1px solid #fde68a38; border-radius:7px; color:#111; background:#fde68a; cursor:pointer; font-size:.6rem; font-weight:700; }.party-request-banner button.quiet { color:#fde68a; background:transparent; }
+  .dock-more { position:relative; }.more-button { font-size:1.05rem; letter-spacing:.12em; }.queue-button { position:relative; }.queue-button b { position:absolute; right:-2px; top:-3px; min-width:1.25em; padding:.1rem .24rem; border-radius:999px; color:#111; background:#fff; font:700 .52rem ui-monospace,monospace; }.dock-menu { position:absolute; right:0; bottom:calc(100% + .55rem); z-index:60; display:flex; min-width:170px; flex-direction:column; gap:2px; padding:.35rem; border:1px solid #ffffff18; border-radius:10px; background:#111114f2; box-shadow:0 18px 50px #000b; }.dock-menu button { border:0; border-radius:7px; padding:.5rem .6rem; color:#eee; background:transparent; text-align:left; cursor:pointer; font-size:.68rem; }.dock-menu button:hover { background:#ffffff12; }
+
   .party-pill { gap:.42rem; min-height:34px; padding:.45rem .75rem; border:1px solid #ffffff14; border-radius:999px; color:#ffffffa3; background:#ffffff08; cursor:pointer; font-size:.7rem; font-weight:600; display:inline-flex; align-items:center; justify-content:center; transition:transform .18s ease,background .18s ease,color .18s ease; }
   .party-pill:hover { color:#fff; background:#ffffff15; }
   .party-pill:active { transform:scale(.94); }
@@ -1355,5 +1425,5 @@
   @media (max-width:760px) {
     .theatre.queue-visible .theatre-main { transform:translateX(0) scale(1); }
   }
-  @media (max-width:430px) { .source-label { font-size:.54rem; letter-spacing:.14em; }.secondary-left .icon-button:first-child { display:none; }.text-pill { padding-inline:.45rem; }.text-pill span { display:none; }.text-pill svg { width:15px; height:15px; }.dock-scrubber { gap:.45rem; font-size:.61rem; }.queue-drawer { width:100vw; } }
+  @media (max-width:430px) { .lyrics-scrim :global(.karaoke-line),.lyric-line { font-size:1.35rem; } .lyrics-scrim :global(.karaoke-line.active),.lyric-line.active { font-size:1.75rem; } .source-label { font-size:.54rem; letter-spacing:.14em; }.secondary-left .icon-button:first-child { display:none; }.text-pill { padding-inline:.45rem; }.text-pill span { display:none; }.text-pill svg { width:15px; height:15px; }.dock-scrubber { gap:.45rem; font-size:.61rem; }.queue-drawer { width:100vw; } }
 </style>

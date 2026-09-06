@@ -1,6 +1,7 @@
 ﻿"""Local YouTube Music API bridge."""
 from pathlib import Path
 import json
+import logging
 import os
 import tempfile
 import subprocess
@@ -23,6 +24,27 @@ from functools import wraps
 from flask import Flask, jsonify, request, send_file, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+        }
+        if hasattr(record, "extra_data"):
+            log_obj.update(record.extra_data)
+        return json.dumps(log_obj)
+
+
+logger = logging.getLogger("ytm-player")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONFormatter())
+    logger.addHandler(handler)
+logger.propagate = False
+
 try:
     from .media_engine import media_engine_bp
 except ImportError:
@@ -44,7 +66,18 @@ except ImportError:
     from tunnel import TUNNEL_MANAGER
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
 app.register_blueprint(media_engine_bp)
+
+
+def local_only(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        addr = str(request.remote_addr or '')
+        if addr not in ('127.0.0.1', '::1') and not addr.startswith('127.') and not addr.endswith('127.0.0.1'):
+            return jsonify({'error': 'Forbidden: endpoint restricted to local host'}), 403
+        return fn(*args, **kwargs)
+    return wrapped
 
 # The desktop player is the source of truth. Remote clients enqueue commands
 # here, while the desktop frontend polls and acknowledges them. Keeping this
@@ -610,7 +643,10 @@ def download_to_cache(video_id, headers):
                 evict_cache()
                 analyze_cached_audio(vid)
         except Exception as exc:
-            print(f"Cache download failed for {vid}: {exc}", flush=True)
+            logger.error(
+                "Background cache download failed",
+                extra={"extra_data": {"video_id": vid, "error": str(exc)}},
+            )
         finally:
             with _cache_inflight_lock:
                 _cache_inflight.discard(vid)
@@ -618,8 +654,10 @@ def download_to_cache(video_id, headers):
 
 
 def db_connection():
-    connection = sqlite3.connect(STATS_PATH)
+    connection = sqlite3.connect(STATS_PATH, timeout=15.0)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA synchronous = NORMAL")
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
@@ -751,6 +789,22 @@ def init_stats_db():
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             thumbnail TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS favorite_tracks (
+            video_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            artist TEXT NOT NULL DEFAULT '',
+            album TEXT NOT NULL DEFAULT '',
+            thumbnail_url TEXT,
+            duration TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS favorite_albums (
+            album_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            artist TEXT NOT NULL DEFAULT '',
+            thumbnail_url TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
         db.execute("""CREATE TABLE IF NOT EXISTS playlist_history (
@@ -1010,25 +1064,57 @@ def auth_headers():
                     if key.lower().replace("_", "-") in ("cookie", "user-agent") and value}
     return {}
 
+def sanitize_track_title(title: str) -> str:
+    """Remove provider/video noise while preserving natural word spacing."""
+    value = clean(title)
+    value = re.sub(
+        r"[\(\[][^\)\]]*(?:official|feat|ft|video|audio|remix|visualizer|clip|lyrics)[^\)\]]*[\)\]]",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"\s*[\(\[]\s*(?:4k|hd|remastered)\s*[\)\]]", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+-\s+(?:official.*|lyrics?|video|audio|visualizer)\s*$", "", value, flags=re.IGNORECASE)
+    return clean(value)
+
+
 def clean_track_meta(title, artist):
     """Normalize music metadata before catalog/lyrics lookups."""
-    clean_title = clean(title)
-    clean_title = re.sub(r"\s*[\(\[](?:feat\.|ft\.|with).*?[\)\]]", "", clean_title, flags=re.I)
-    clean_title = re.sub(r"\s*[\(\[](?:(?:official\s*(?:music\s*)?(?:video|audio))|visualizer|lyrics?|hd|4k|remastered).*?[\)\]]", "", clean_title, flags=re.I)
-    clean_title = re.sub(r"\s+-\s+.*$", "", clean_title).strip()
+    clean_title = sanitize_track_title(title)
     clean_artist = re.sub(r"\s*-\s*Topic(?=\s*(?:,|$))", "", clean(artist), flags=re.I)
     clean_artist = re.sub(r",.*$", "", clean_artist).strip()
     return clean_title, clean_artist
 
 
 def parse_lrc(text):
+    """Parse ordinary and enhanced LRC without collapsing word boundaries."""
     lines = []
     for raw in (text or "").splitlines():
         matches = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", raw)
-        lyric = re.sub(r"(?:\[\d+:\d+(?:\.\d+)?\])+", "", raw).strip()
+        if not matches:
+            continue
+        line_start = int(matches[0][0]) * 60 + float(matches[0][1])
+        body = re.sub(r"(?:\[\d+:\d+(?:\.\d+)?\])+", "", raw).strip()
+        inline = list(re.finditer(r"<((?:\d+):\d+(?:\.\d+)?)>", body))
+        words = []
+        if inline:
+            for index, marker in enumerate(inline):
+                value = marker.group(1)
+                minutes, seconds = value.split(":", 1)
+                start = int(minutes) * 60 + float(seconds)
+                end = inline[index + 1].start() if index + 1 < len(inline) else len(body)
+                token = re.sub(r"<[^>]+>", "", body[marker.end():end]).strip()
+                if token:
+                    words.append({"text": token, "start": round(start, 3), "end": round(start + 0.1, 3)})
+            lyric = " ".join(word["text"] for word in words)
+        else:
+            lyric = clean(body)
         for minutes, seconds in matches:
             if lyric:
-                lines.append({"time": int(minutes) * 60 + float(seconds), "text": clean(lyric)})
+                line = {"time": int(minutes) * 60 + float(seconds), "text": clean(lyric)}
+                if words:
+                    line["words"] = words
+                lines.append(line)
     return sorted(lines, key=lambda line: line["time"])
 
 def api_error(exc, status=502):
@@ -1298,7 +1384,7 @@ def normalize_track(item):
     title = clean(title)
     artist = clean(artist)
     track_id = clean(track_id)
-    placeholder_titles = {"unknown", "unknown title", "unknown audio", "untitled", ""}
+    placeholder_titles = {"unknown", "unknown title", "unknown artist", "unknown audio", "untitled", ""}
     placeholder_artists = {"unknown", "unknown artist", "unknown audio", "untitled", ""}
     if (not title or not track_id or title.lower() in placeholder_titles or
             not artist or artist.lower() in placeholder_artists or not artwork_url):
@@ -1551,6 +1637,7 @@ def estimate_timestamps(text, duration=None):
     return result
 
 
+@app.get("/remote")
 @app.get("/mobile")
 def mobile_remote():
     """Serve the installable iPhone remote from the same Flask origin."""
@@ -1805,6 +1892,7 @@ def trigger_system_update():
 
 
 @app.post("/api/auth/logout")
+@local_only
 def auth_logout():
     """Forget the stored credentials and drop the live client.
 
@@ -1907,6 +1995,7 @@ def parse_headers_text(raw):
 
 
 @app.post("/api/auth/setup")
+@local_only
 def auth_setup():
     """Validate and atomically persist pasted ytmusicapi credentials.
 
@@ -1985,11 +2074,31 @@ def lyrics():
                 data = json.loads(response.read().decode("utf-8"))
             parsed = parse_lrc(data.get("syncedLyrics", ""))
             if parsed:
-                return jsonify({"synced": True, "lines": parsed})
+                return jsonify({"synced": True, "lines": parsed, "source": "lrclib"})
             plain = str(data.get("plainLyrics") or "").strip()
         except Exception:
             pass
-        # 2. Fall back to YouTube Music's native lyrics when LRCLIB has no record.
+
+        # 2. LRCLIB's search endpoint is more forgiving when an exact metadata
+        #    match is unavailable (remixes, alternate punctuation, and uploads
+        #    with slightly different durations). Prefer the first synced hit.
+        try:
+            search_query = urllib.parse.quote(f"{artist} {title}")
+            with urllib.request.urlopen(
+                f"https://lrclib.net/api/search?q={search_query}", timeout=8
+            ) as response:
+                hits = json.loads(response.read().decode("utf-8"))
+            if isinstance(hits, list):
+                for hit in hits:
+                    if not isinstance(hit, dict) or not hit.get("syncedLyrics"):
+                        continue
+                    parsed = parse_lrc(hit.get("syncedLyrics", ""))
+                    if parsed:
+                        return jsonify({"synced": True, "lines": parsed, "source": "lrclib-search"})
+        except Exception:
+            pass
+
+        # 3. Fall back to YouTube Music's native lyrics when LRCLIB has no record.
         client = get_yt()
         if client is not None and track_id:
             try:
@@ -2003,7 +2112,7 @@ def lyrics():
                         return jsonify({"synced": True, "lines": parsed})
             except Exception:
                 pass
-        # 3. Never degrade to a dead text block: synthesize proportional timestamps
+        # 4. Never degrade to a dead text block: synthesize proportional timestamps
         #    from whatever plain lyrics we found so the frontend lines stay clickable.
         if plain:
             lines = estimate_timestamps(plain, duration)
@@ -2375,6 +2484,32 @@ def monthly_top():
     return jsonify({"month": month, "totalMinutes": round(total / 60), "monthly": [dict(track, plays=row["plays"]) for row in rows if (track := stat_track(row))],
                     "heavyRotation": [dict(track, plays=row["plays"]) for row in all_time if (track := stat_track(row))]})
 
+
+@app.get("/api/stats/recent-history")
+def recent_history():
+    """Return the user's durable playback tape, independent of the live queue.
+
+    The queue is intentionally session-scoped, while this endpoint is backed by
+    SQLite so Recently Played still has data after a restart or refresh.
+    """
+    with db_connection() as db:
+        rows = db.execute("""SELECT id, video_id, title, artist, album, thumbnail_url,
+            played_at_timestamp, listen_duration_seconds
+            FROM listens WHERE video_id != ''
+            ORDER BY datetime(played_at_timestamp) DESC, id DESC LIMIT 50""").fetchall()
+    tracks = []
+    for row in rows:
+        track = stat_track(row)
+        if not track:
+            continue
+        tracks.append({
+            **track,
+            "playedAt": row["played_at_timestamp"],
+            "listenDurationSeconds": row["listen_duration_seconds"],
+        })
+    return jsonify({"tracks": tracks})
+
+
 @app.get("/api/stats/analytics")
 def stats_analytics():
     """Return the native listening dashboard's range-aware aggregates.
@@ -2437,6 +2572,124 @@ def stats_analytics():
     except Exception as exc:
         traceback.print_exc()
         return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/stats/recap")
+def stats_recap():
+    """Return Wrapped-style recaps and comparable leaderboards from SQLite."""
+    ranges = {"7": 7, "30": 30, "180": 180, "all": None}
+    range_name = clean(request.args.get("range") or "30").lower()
+    if range_name not in ranges:
+        return jsonify({"error": "range must be one of: 7, 30, 180, all"}), 400
+
+    days = ranges[range_name]
+    now = datetime.now(timezone.utc)
+    current_cutoff = now - timedelta(days=days) if days is not None else None
+    previous_cutoff = current_cutoff - timedelta(days=days) if days is not None else None
+    current_where = ""
+    current_params = []
+    previous_where = ""
+    previous_params = []
+    if current_cutoff is not None:
+        current_where = " WHERE played_at_timestamp >= ?"
+        current_params = [current_cutoff.isoformat()]
+        previous_where = " WHERE played_at_timestamp >= ? AND played_at_timestamp < ?"
+        previous_params = [previous_cutoff.isoformat(), current_cutoff.isoformat()]
+
+    def ranked(rows, key):
+        current = {key(row): index + 1 for index, row in enumerate(rows)}
+        return current
+
+    def with_movement(rows, previous_rows, key):
+        previous = ranked(previous_rows, key)
+        output = []
+        for index, row in enumerate(rows, 1):
+            item = dict(row)
+            old_rank = previous.get(key(item))
+            item["rank"] = index
+            item["movement"] = "new" if old_rank is None else old_rank - index
+            output.append(item)
+        return output
+
+    try:
+        with db_connection() as db:
+            metrics = db.execute(f"""SELECT COALESCE(SUM(listen_duration_seconds), 0) total_seconds,
+                COUNT(*) total_tracks, COUNT(DISTINCT NULLIF(TRIM(artist), '')) unique_artists
+                FROM listens{current_where}""", current_params).fetchone()
+
+            def track_rows(where, params, limit=10):
+                return db.execute(f"""SELECT video_id, MAX(title) title, MAX(artist) artist,
+                    MAX(album) album, MAX(thumbnail_url) thumbnail, COUNT(*) plays,
+                    COALESCE(SUM(listen_duration_seconds), 0) seconds, MAX(played_at_timestamp) last_played
+                    FROM listens{where} GROUP BY video_id ORDER BY plays DESC, seconds DESC LIMIT {limit}""", params).fetchall()
+
+            def artist_rows(where, params, limit=10):
+                return db.execute(f"""SELECT COALESCE(NULLIF(TRIM(artist), ''), 'Unknown artist') artist,
+                    MAX(video_id) video_id, MAX(title) title, MAX(thumbnail_url) thumbnail,
+                    COUNT(*) plays, COALESCE(SUM(listen_duration_seconds), 0) seconds,
+                    MAX(played_at_timestamp) last_played
+                    FROM listens{where} GROUP BY artist ORDER BY plays DESC, seconds DESC LIMIT {limit}""", params).fetchall()
+
+            def album_rows(where, params, limit=10):
+                return db.execute(f"""SELECT COALESCE(NULLIF(TRIM(album), ''), 'Singles') album,
+                    MAX(artist) artist, MAX(video_id) video_id, MAX(title) title,
+                    MAX(thumbnail_url) thumbnail, COUNT(*) plays,
+                    COALESCE(SUM(listen_duration_seconds), 0) seconds,
+                    MAX(played_at_timestamp) last_played
+                    FROM listens{where} GROUP BY COALESCE(NULLIF(TRIM(album), ''), 'Singles')
+                    ORDER BY plays DESC, seconds DESC LIMIT {limit}""", params).fetchall()
+
+            current_tracks = [dict(row, **(stat_track(row) or {})) for row in track_rows(current_where, current_params) if stat_track(row)]
+            previous_tracks = [dict(row, **(stat_track(row) or {})) for row in track_rows(previous_where, previous_params) if stat_track(row)]
+            current_artists = [dict(row) for row in artist_rows(current_where, current_params)]
+            previous_artists = [dict(row) for row in artist_rows(previous_where, previous_params)]
+            current_albums = [dict(row) for row in album_rows(current_where, current_params)]
+            previous_albums = [dict(row) for row in album_rows(previous_where, previous_params)]
+
+            obsession = db.execute(f"""SELECT date(played_at_timestamp) day, video_id,
+                MAX(title) title, MAX(artist) artist, COUNT(*) plays
+                FROM listens{current_where} GROUP BY day, video_id ORDER BY plays DESC LIMIT 1""", current_params).fetchone()
+            peak_hour = db.execute(f"""SELECT CAST(strftime('%H', played_at_timestamp) AS INTEGER) hour,
+                COUNT(*) plays FROM listens{current_where} GROUP BY hour ORDER BY plays DESC LIMIT 1""", current_params).fetchone()
+            marathon = db.execute(f"""SELECT date(played_at_timestamp) day,
+                COUNT(*) plays, COALESCE(SUM(listen_duration_seconds), 0) seconds
+                FROM listens{current_where} GROUP BY day ORDER BY seconds DESC LIMIT 1""", current_params).fetchone()
+
+        total_plays = int(metrics["total_tracks"] or 0)
+        top_artist = current_artists[0] if current_artists else None
+        recap = {
+            "obsession": dict(obsession) if obsession else None,
+            "clockDensity": {"hour": int(peak_hour["hour"]), "plays": int(peak_hour["plays"])} if peak_hour else None,
+            "heavyweight": {"artist": top_artist["artist"], "plays": top_artist["plays"], "share": round((top_artist["plays"] / total_plays) * 100) if total_plays else 0} if top_artist else None,
+            "marathon": dict(marathon) if marathon else None,
+        }
+        return jsonify({
+            "range": range_name,
+            "metrics": {"totalSeconds": metrics["total_seconds"] or 0, "totalTracks": total_plays, "uniqueArtists": metrics["unique_artists"] or 0},
+            "recap": recap,
+            "leaderboards": {
+                "tracks": with_movement(current_tracks, previous_tracks, lambda row: row.get("videoId") or row.get("video_id")),
+                "artists": with_movement(current_artists, previous_artists, lambda row: row.get("artist")),
+                "albums": with_movement(current_albums, previous_albums, lambda row: row.get("album")),
+            },
+        })
+    except Exception as exc:
+        traceback.print_exc()
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/stats/forgotten-gems")
+def forgotten_gems():
+    """Return well-loved tracks not heard in the last 30 days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    with db_connection() as db:
+        rows = db.execute("""SELECT video_id, MAX(title) title, MAX(artist) artist, MAX(album) album,
+            MAX(thumbnail_url) thumbnail, COUNT(*) plays,
+            COALESCE(SUM(listen_duration_seconds), 0) seconds
+            FROM listens GROUP BY video_id
+            HAVING COUNT(*) >= 5 AND MAX(played_at_timestamp) < ?
+            ORDER BY plays DESC, MAX(played_at_timestamp) DESC LIMIT 25""", (cutoff,)).fetchall()
+    return jsonify({"tracks": [dict(stat_track(row), plays=row["plays"], seconds=row["seconds"]) for row in rows if stat_track(row)]})
 
 
 def canonical_source_metadata(db, canonical_ids):
@@ -2669,12 +2922,24 @@ def delete_smart_playlist(playlist_id):
 
 @app.get("/api/stats/export")
 def export_stats():
-    """Dump every recorded listen as JSON for the user to download."""
-    with db_connection() as db:
-        rows = db.execute("SELECT * FROM listens ORDER BY played_at_timestamp").fetchall()
-    return jsonify({"exported_at": datetime.now(timezone.utc).isoformat(),
-                    "count": len(rows),
-                    "listens": [dict(row) for row in rows]})
+    """Stream every recorded listen without materializing the table in memory."""
+    exported_at = datetime.now(timezone.utc).isoformat()
+
+    def generate_export():
+        with db_connection() as db:
+            count = db.execute("SELECT COUNT(*) FROM listens").fetchone()[0]
+            cursor = db.execute("SELECT * FROM listens ORDER BY played_at_timestamp")
+            yield json.dumps({"exported_at": exported_at, "count": count, "listens": []})[:-2]
+            first = True
+            for row in cursor:
+                if first:
+                    first = False
+                else:
+                    yield ","
+                yield json.dumps(dict(row), default=str)
+            yield "]}"
+
+    return Response(stream_with_context(generate_export()), mimetype="application/json")
 
 @app.get("/api/home/quick-picks")
 def quick_picks():
@@ -2706,49 +2971,243 @@ def quick_picks():
     except Exception as exc:
         return api_error(exc)
 
+GENRE_ARTIST_SEEDS = {
+    "UK Real Rap": ["Nines", "Potter Payper", "Skrapz", "Rimzee"],
+    "UK Drill": ["Digga D", "CB", "Suspect", "Loski"],
+    "US Trap": ["Future", "Young Thug", "21 Savage", "Lil Baby"],
+    "Melodic Drill": ["Central Cee", "Headie One", "Unknown T", "Russ Millions"],
+    "Pluggnb": ["Summrs", "Autumn!", "Kankan", "Destroy Lonely"],
+    "Afroswing": ["J Hus", "NSG", "Kojo Funds", "Not3s"],
+    "R&B": ["SZA", "Brent Faiyaz", "The Weeknd", "Victoria Monet"],
+    "Wave": ["Night Lovell", "Bones", "Xavier Wulf", "Ramirez"],
+}
+
+
+def _search_provider_songs(client, query, limit=12):
+    try:
+        return client.search(query, filter="songs", limit=limit) or []
+    except TypeError:
+        return client.search(query, filter="songs") or []
+
+
+@app.get("/api/home/recommendations")
+@rate_limit("home-genre", 8, 20)
+def home_recommendations():
+    genre = clean(request.args.get("genre"))
+    if genre == "All":
+        return quick_picks()
+    seeds = GENRE_ARTIST_SEEDS.get(genre)
+    if not seeds:
+        return jsonify({"error": "Unknown genre", "tracks": []}), 400
+    client = get_yt()
+    if client is None:
+        return jsonify({"error": "ytmusicapi is not available", "tracks": []}), 502
+    tracks, seen = [], set()
+    try:
+        for artist in seeds:
+            for item in _search_provider_songs(client, f"{artist} top tracks", 8):
+                track = track_data(item)
+                if track and track["videoId"] not in seen:
+                    seen.add(track["videoId"])
+                    tracks.append(track)
+                if len(tracks) >= 24:
+                    break
+            if len(tracks) >= 24:
+                break
+        return jsonify({"genre": genre, "seeds": seeds, "tracks": tracks})
+    except Exception as exc:
+        return api_error(exc)
+
+
+@app.get("/api/home/shelves")
+@rate_limit("home-shelves", 6, 20)
+def home_shelves():
+    try:
+        page = max(0, int(request.args.get("page", 0)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "page must be an integer", "shelves": []}), 400
+    page = min(page, 20)
+    offset = page * 4
+    with db_connection() as db:
+        rows = db.execute("""SELECT video_id, MAX(title) title, MAX(artist) artist,
+            MAX(album) album, MAX(thumbnail_url) thumbnail, COUNT(*) plays,
+            MAX(played_at_timestamp) played_at
+            FROM listens WHERE video_id != '' GROUP BY video_id
+            ORDER BY played_at DESC LIMIT 24 OFFSET ?""", (offset,)).fetchall()
+    local_tracks = []
+    for row in rows:
+        track = stat_track(row)
+        if track:
+            track["playedAt"] = row["played_at"]
+            track["plays"] = row["plays"]
+            local_tracks.append(track)
+    client = get_yt()
+    shelves = []
+    if local_tracks:
+        shelves.append({"id": f"heavy-{page}", "title": "Heavy Rotation", "items": local_tracks[:12]})
+        shelves.append({"id": f"fresh-{page}", "title": "Underground & Fresh Drops", "items": local_tracks[12:24]})
+    if client is not None:
+        names = []
+        with db_connection() as db:
+            names = [clean(row["artist"]) for row in db.execute("""SELECT artist, COUNT(*) plays
+                FROM listens WHERE artist != '' GROUP BY lower(artist)
+                ORDER BY plays DESC LIMIT 4 OFFSET ?""", (page * 2,)).fetchall()]
+        for index, name in enumerate(names[:2]):
+            tracks = []
+            seen = set()
+            for item in _search_provider_songs(client, f"{name} top tracks", 8):
+                track = track_data(item)
+                if track and track["videoId"] not in seen:
+                    seen.add(track["videoId"])
+                    tracks.append(track)
+            if tracks:
+                shelves.append({"id": f"artist-{page}-{index}", "title": f"Because you listen to {name}", "items": tracks})
+    return jsonify({"page": page, "has_more": bool(local_tracks) or page < 2, "shelves": shelves})
+
+
+@app.get("/api/discover/artists")
+def discover_artists():
+    """Return normalized artist chips for the mixer shelf.
+
+    Local favorites/history provide the names immediately; authenticated provider
+    search enriches them with canonical IDs and the largest available thumbnail.
+    """
+    candidates = []
+    with db_connection() as db:
+        candidates.extend({"id": row["id"], "name": row["name"], "thumbnail": row["thumbnail"]}
+                          for row in db.execute("SELECT id, name, thumbnail FROM favorite_artists ORDER BY datetime(created_at) DESC LIMIT 20"))
+        rows = db.execute("""SELECT artist, MAX(thumbnail_url) thumbnail, COUNT(*) plays
+            FROM listens WHERE artist != '' GROUP BY lower(artist)
+            ORDER BY plays DESC, MAX(played_at_timestamp) DESC LIMIT 30""").fetchall()
+        candidates.extend({"id": None, "name": row["artist"], "thumbnail": row["thumbnail"]} for row in rows)
+    seen = set()
+    artists = []
+    client = get_yt()
+    for candidate in candidates:
+        name = clean(candidate.get("name"))
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        artist_id = clean(candidate.get("id")) or None
+        thumbnail_url = candidate.get("thumbnail")
+        if client is not None and not artist_id:
+            try:
+                match = (client.search(name, filter="artists", limit=1) or [None])[0] or {}
+                artist_id = clean(match.get("browseId") or match.get("id")) or None
+                thumbs = match.get("thumbnails") or []
+                if thumbs:
+                    thumbnail_url = (thumbs[-1].get("url") if isinstance(thumbs[-1], dict) else thumbs[-1]) or thumbnail_url
+            except Exception:
+                pass
+        artists.append({"id": artist_id or name, "name": name, "thumbnail": thumbnail_url or None})
+        if len(artists) >= 24:
+            break
+    return jsonify({"artists": artists})
+
+
+@app.post("/api/mix/compile")
 @app.post("/api/queue/artist-mix")
 @rate_limit("artist_mix", 6, 60)
 def artist_mix_queue():
-    """Build a balanced queue from two to four requested artists.
+    """Build a deduplicated, round-robin queue from two to four artists.
 
-    Artist names and browse IDs are accepted because library payloads use both.
-    Each artist contributes a small top-song pool; the final queue is emitted
-    round-robin so one catalog cannot crowd out the others.
+    Each requested artist contributes up to ten playable tracks. Names use the
+    provider search index; browse IDs use the artist catalog when available.
+    The global ``seen`` set prevents the same track appearing twice when search
+    results overlap between artists.
     """
     payload = request.get_json(silent=True) or {}
-    artists = payload.get("artists")
-    if not isinstance(artists, list):
+    requested = payload.get("artists")
+    if not isinstance(requested, list):
         return jsonify({"error": "artists must be an array", "tracks": []}), 400
-    artists = [clean(item.get("name") if isinstance(item, dict) else item) for item in artists]
-    artists = list(dict.fromkeys(item for item in artists if item))
-    if not 2 <= len(artists) <= 4:
+
+    specs = []
+    seen_specs = set()
+    for item in requested:
+        if isinstance(item, dict):
+            name = clean(item.get("name") or item.get("title"))
+            artist_id = clean(item.get("id") or item.get("browseId"))
+        else:
+            name, artist_id = clean(item), ""
+        key = re.sub(r"\s+", " ", name).casefold() or artist_id.casefold()
+        if key and key not in seen_specs:
+            seen_specs.add(key)
+            specs.append({"name": name, "id": artist_id})
+    if not 2 <= len(specs) <= 4:
         return jsonify({"error": "Choose between 2 and 4 artists", "tracks": []}), 400
+
     client = get_yt()
     if client is None:
         return jsonify({"error": "ytmusicapi is not available", "tracks": []}), 502
     try:
         pools = []
-        for artist in artists:
-            matches = client.search(artist, filter="songs", limit=10) or []
-            pool, seen = [], set()
-            for item in matches:
-                track = track_data(item)
-                if not track or track["videoId"] in seen:
+        artists = []
+        for spec in specs:
+            label = spec["name"] or spec["id"]
+            matches = []
+            if spec["id"]:
+                try:
+                    artist_data = client.get_artist(spec["id"]) or {}
+                    matches = artist_data.get("songs") or artist_data.get("topSongs") or []
+                    label = clean(artist_data.get("name")) or label
+                except Exception as exc:
+                    print(f"Artist catalog lookup failed for {spec['id']!r}: {exc}", flush=True)
+            if not matches:
+                matches = client.search(f"{label} top tracks", filter="songs", limit=10) or []
+
+            expected_artist = re.sub(r"[^a-z0-9]+", "", label.casefold())
+            pool, pool_seen = [], set()
+            for item in matches[:10]:
+                raw_artists = item.get("artists") or item.get("artist") or item.get("author") if isinstance(item, dict) else None
+                raw_artists = raw_artists if isinstance(raw_artists, list) else [raw_artists]
+                provider_artists = []
+                for value in raw_artists:
+                    artist_name = _field_text(value) if not isinstance(value, str) else value
+                    normalized_artist = re.sub(r"[^a-z0-9]+", "", clean(artist_name).casefold())
+                    if normalized_artist:
+                        provider_artists.append(normalized_artist)
+                if expected_artist and expected_artist not in provider_artists:
                     continue
-                seen.add(track["videoId"])
-                track["mix_artist"] = artist
+                track = track_data(item)
+                if not track or not valid_video_id(track["videoId"]) or track["videoId"] in pool_seen:
+                    continue
+                pool_seen.add(track["videoId"])
                 pool.append(track)
+            artists.append(label)
             pools.append(pool)
-        tracks = []
+
+        empty_artists = [artists[index] for index, pool in enumerate(pools) if not pool]
+        if empty_artists:
+            return jsonify({
+                "error": "No playable tracks found for: " + ", ".join(empty_artists),
+                "artists": artists,
+                "empty_artists": empty_artists,
+                "tracks": [],
+            }), 422
+
+        tracks, global_seen = [], set()
         index = 0
         while len(tracks) < 40 and any(index < len(pool) for pool in pools):
             for pool in pools:
-                if index < len(pool):
-                    tracks.append(pool[index])
-                    if len(tracks) >= 40:
-                        break
+                if index >= len(pool):
+                    continue
+                track = pool[index]
+                if track["videoId"] in global_seen:
+                    continue
+                global_seen.add(track["videoId"])
+                tracks.append({
+                    "id": track["videoId"],
+                    "videoId": track["videoId"],
+                    "title": track["title"],
+                    "artist": track["artist"],
+                    "duration": track.get("duration") or 0,
+                    "thumbnail": track.get("thumbnail"),
+                    "artwork": track.get("artwork") or track.get("thumbnail"),
+                })
+                if len(tracks) >= 40:
+                    break
             index += 1
-        return jsonify({"artists": artists, "tracks": tracks, "source": "artist_search_round_robin"})
+        return jsonify({"artists": artists, "tracks": tracks, "source": "artist_round_robin"})
     except Exception as exc:
         traceback.print_exc()
         return jsonify({"error": str(exc), "tracks": []}), 502
@@ -3347,6 +3806,96 @@ def playlists():
                 return jsonify({"cached": True, "playlists": cached})
         return api_error(exc)
 
+@app.get("/api/library/favorites")
+def library_favorites():
+    """Return provider/local favorites, falling back to high-rotation history."""
+    client = get_yt()
+    if client is not None:
+        try:
+            songs = client.get_liked_songs(limit=None).get("tracks", []) or []
+            tracks = [track for item in songs if (track := track_data(item))]
+            if tracks:
+                return jsonify({"tracks": tracks, "source": "provider"})
+        except Exception:
+            pass
+    with db_connection() as db:
+        rows = db.execute("""SELECT video_id, title, artist, album, thumbnail_url, duration
+            FROM favorite_tracks ORDER BY datetime(created_at) DESC""").fetchall()
+        explicit = [
+            {"videoId": row["video_id"], "id": row["video_id"], "title": row["title"],
+             "artist": row["artist"], "album": row["album"], "thumbnail": row["thumbnail_url"],
+             "duration": row["duration"]}
+            for row in rows
+        ]
+        if explicit:
+            return jsonify({"tracks": explicit, "source": "local"})
+        fallback = db.execute("""SELECT video_id, MAX(title) title, MAX(artist) artist,
+            MAX(album) album, MAX(thumbnail_url) thumbnail_url, COUNT(*) play_count,
+            MAX(listen_duration_seconds) duration
+            FROM listens WHERE video_id != '' GROUP BY video_id
+            ORDER BY play_count DESC, MAX(played_at_timestamp) DESC LIMIT 50""").fetchall()
+        tracks = [track for row in fallback if (track := stat_track(row))]
+        return jsonify({"tracks": tracks, "source": "history"})
+
+
+@app.post("/api/library/favorites/toggle")
+@app.post("/api/library/toggle-favorite")
+def toggle_library_favorite():
+    payload = request.get_json(silent=True) or {}
+    item = payload.get("track") if isinstance(payload.get("track"), dict) else payload.get("item") if isinstance(payload.get("item"), dict) else payload
+    if not isinstance(item, dict):
+        return jsonify({"error": "item must be an object"}), 400
+    item_type = clean(item.get("type")).lower()
+    if item_type == "artist" or (item.get("artistId") and not item.get("videoId")):
+        artist_id = clean(item.get("artistId") or item.get("id"))
+        artist_name = clean(item.get("name") or item.get("title") or item.get("artist"))
+        if not artist_id or not artist_name:
+            return jsonify({"error": "artist id and name are required"}), 400
+        with db_connection() as db:
+            exists = db.execute("SELECT 1 FROM favorite_artists WHERE id = ?", (artist_id,)).fetchone()
+            if exists:
+                db.execute("DELETE FROM favorite_artists WHERE id = ?", (artist_id,))
+                favorited = False
+            else:
+                db.execute("INSERT INTO favorite_artists (id, name, thumbnail) VALUES (?, ?, ?)", (artist_id, artist_name, clean(item.get("thumbnail")) or None))
+                favorited = True
+        return jsonify({"favorited": favorited, "id": artist_id, "type": "artist"})
+
+    if item_type == "album":
+        album_id = clean(item.get("albumId") or item.get("id") or item.get("browseId"))
+        album_title = clean(item.get("title") or item.get("name"))
+        if not album_id or not album_title:
+            return jsonify({"error": "album id and title are required"}), 400
+        with db_connection() as db:
+            exists = db.execute("SELECT 1 FROM favorite_albums WHERE album_id = ?", (album_id,)).fetchone()
+            if exists:
+                db.execute("DELETE FROM favorite_albums WHERE album_id = ?", (album_id,))
+                favorited = False
+            else:
+                db.execute("INSERT INTO favorite_albums (album_id, title, artist, thumbnail_url) VALUES (?, ?, ?, ?)", (album_id, album_title, clean(item.get("artist")), clean(item.get("thumbnail")) or None))
+                favorited = True
+        return jsonify({"favorited": favorited, "id": album_id, "type": "album"})
+
+    video_id = clean(item.get("videoId") or item.get("video_id") or item.get("id"))
+    if not valid_video_id(video_id):
+        return jsonify({"error": "A valid videoId is required"}), 400
+    with db_connection() as db:
+        exists = db.execute("SELECT 1 FROM favorite_tracks WHERE video_id = ?", (video_id,)).fetchone()
+        if exists:
+            db.execute("DELETE FROM favorite_tracks WHERE video_id = ?", (video_id,))
+            favorited = False
+        else:
+            db.execute("""INSERT INTO favorite_tracks
+                (video_id, title, artist, album, thumbnail_url, duration)
+                VALUES (?, ?, ?, ?, ?, ?)""", (
+                    video_id, clean(item.get("title")) or "Untitled track",
+                    clean(item.get("artist")), clean(item.get("album")),
+                    clean(item.get("thumbnail")) or None, clean(item.get("duration")) or None,
+                ))
+            favorited = True
+    return jsonify({"favorited": favorited, "videoId": video_id, "type": "track"})
+
+
 @app.get("/api/liked")
 def liked():
     client = get_yt()
@@ -3865,11 +4414,17 @@ def stream(track_id):
     if not resolved:
         return jsonify({"error": "Invalid or unknown track id", "url": None}), 400
     source, source_id = resolved["source"], resolved["source_id"]
-    print(f"Resolving {source} stream for track_id: {track_id} (source_id={source_id})", flush=True)
+    logger.info(
+        "Resolving stream",
+        extra={"extra_data": {"source": source, "track_id": track_id, "source_id": source_id}},
+    )
     # Existing local audio cache is keyed by the YouTube source id.
     cached = cached_audio(source_id) if source == "youtube" else None
     if cached is not None:
-        print(f"Stream served from cache: {cached.name}", flush=True)
+        logger.info(
+            "Stream served from cache",
+            extra={"extra_data": {"source": source, "source_id": source_id, "cache_file": cached.name}},
+        )
         return jsonify({"url": f"/api/stream-cache/{source_id}", "cached": True, "title": None,
                         "source": source, "source_id": source_id, "video_id": source_id})
     track_id = clean(track_id)
@@ -3906,8 +4461,11 @@ def stream(track_id):
                         "source": source, "source_id": source_id, "video_id": source_id,
                         "canonical_id": track_id if valid_canonical_id(track_id) else None})
     except Exception as exc:
-        traceback.print_exc()
-        print(f"Stream resolver failed for track_id={track_id}: {exc}", flush=True)
+        logger.error(
+            "Stream resolver failed",
+            extra={"extra_data": {"track_id": track_id, "source_id": source_id, "error": str(exc)}},
+            exc_info=True,
+        )
         return jsonify({"error": str(exc), "url": None}), 500
 
 
@@ -3961,8 +4519,11 @@ def proxy_stream(video_id):
         if not stream_url:
             raise RuntimeError("yt-dlp returned no playable format")
     except Exception as exc:
-        traceback.print_exc()
-        print(f"Proxy resolution failed for video_id={video_id}: {exc}", flush=True)
+        logger.error(
+            "Proxy resolution failed",
+            extra={"extra_data": {"video_id": video_id, "error": str(exc)}},
+            exc_info=True,
+        )
         return jsonify({"error": str(exc)}), 500
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     range_header = request.headers.get("Range")
@@ -3989,8 +4550,11 @@ def proxy_stream(video_id):
                 remote.close()
             except Exception:
                 pass
-        traceback.print_exc()
-        print(f"Proxy stream failed for video_id={video_id}: {exc}", flush=True)
+        logger.error(
+            "Proxy stream failed",
+            extra={"extra_data": {"video_id": video_id, "error": str(exc)}},
+            exc_info=True,
+        )
         return jsonify({"error": str(exc)}), 502
 
 

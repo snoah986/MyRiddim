@@ -278,6 +278,10 @@ export const audio = {
     ensure()
     if (ctx.state === 'suspended') ctx.resume()
   },
+  load() {
+    ensure()
+    els[live].el.load()
+  },
   play() {
     ensure()
     if (ctx.state === 'suspended') ctx.resume()

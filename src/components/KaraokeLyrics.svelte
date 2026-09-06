@@ -76,7 +76,8 @@
       const end = Number(node.dataset.end)
       const progress = end > start ? Math.max(0, Math.min(1, (now - start) / (end - start))) : now >= start ? 1 : 0
       node.style.setProperty('--word-progress', String(progress))
-      node.classList.toggle('active', progress > 0)
+      node.classList.toggle('past', now >= end)
+      node.classList.toggle('current', now >= start && now < end)
     })
     syncState.lastLine = active
     if (playing || media && !media.paused) raf = requestAnimationFrame(sync)
@@ -104,7 +105,7 @@
       aria-label={line.isPrompt ? 'Sync karaoke beat' : `Seek to ${line.text || 'lyric line'}`}>
       {#if line.words?.length}
         {#each line.words as word}
-          <span use:registerWord={`${index}:${word.start}:${word.end}`} class="karaoke-word" data-start={word.start} data-end={word.end}>{word.text}{index < line.words.length - 1 ? ' ' : ''}</span>
+          <span use:registerWord={`${index}:${word.start}:${word.end}`} class="karaoke-word" data-start={word.start} data-end={word.end}>{word.text}</span>
         {/each}
       {:else}
         <span class="karaoke-plain">{line.text}</span>
@@ -115,12 +116,14 @@
 
 <style>
   .karaoke-scroll { flex:1; min-height:0; overflow-y:auto; padding:34vh 1rem 30vh; mask-image:linear-gradient(to bottom,transparent 0%,black 15%,black 85%,transparent 100%); }
-  .karaoke-line { display:block; width:100%; padding:.62rem 0; border:0; color:#fff; background:none; text-align:center; font:650 clamp(1.35rem,3.3vw,2.7rem)/1.25 Inter,ui-sans-serif,sans-serif; letter-spacing:-.035em; opacity:.24; filter:blur(1.3px); transform:scale(.95); cursor:pointer; transition:opacity .25s ease,filter .25s ease,transform .25s ease; }
-  .karaoke-line:global(.active) { opacity:1; filter:none; transform:scale(1); }
+  .karaoke-line { display:block; width:100%; padding:.62rem 0; border:0; color:#fff; background:none; text-align:center; font:650 clamp(1.35rem,3.3vw,2.7rem)/1.25 Inter,ui-sans-serif,sans-serif; letter-spacing:-.035em; opacity:.28; filter:blur(.8px); transform:scale(.96); cursor:pointer; transition:all .3s cubic-bezier(.2,0,0,1); }
+  .karaoke-line:global(.active) { opacity:1; filter:blur(0); transform:scale(1.04); }
   .karaoke-line.intro-line { opacity:.9; }
   .karaoke-line.prompt-line { padding:.8rem 1rem; border:1px solid #ffffff2c; border-radius:14px; background:#ffffff10; opacity:.95; }
-  .karaoke-word { --word-progress:0; color:#ffffff55; background:linear-gradient(90deg,#fff calc(var(--word-progress) * 100%),#ffffff55 calc(var(--word-progress) * 100%)); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; white-space:pre-wrap; }
-  .karaoke-word:global(.active) { color:#fff; }
+  .karaoke-word { --word-progress:0; display:inline-block; margin-right:.32em; color:rgba(255,255,255,.4); opacity:1; transition:transform .12s ease,color .12s ease,text-shadow .12s ease; white-space:pre-wrap; }
+  .karaoke-word:global(.past) { color:#fff; }
+  .karaoke-word:global(.current) { color:#fff; font-weight:700; transform:scale(1.14); text-shadow:0 0 20px rgba(255,255,255,.85),0 0 35px rgba(255,255,255,.4); }
+  .karaoke-word:global(.current) + .karaoke-word { margin-left:.02em; }
   .karaoke-line:focus-visible { outline:2px solid #fff; outline-offset:4px; border-radius:8px; }
-  @media (prefers-reduced-motion:reduce) { .karaoke-line { transition:none; } }
+  @media (prefers-reduced-motion:reduce) { .karaoke-line,.karaoke-word { transition:none; } }
 </style>

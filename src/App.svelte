@@ -1,9 +1,10 @@
 <script>
-  import { onMount, onDestroy } from 'svelte'
+  import { onMount, onDestroy, tick } from 'svelte'
   import { spring } from 'svelte/motion'
   import { fade, fly } from 'svelte/transition'
   import { get } from 'svelte/store'
   import { openPlaylist } from './lib/store.js'
+  import { favoritesStore } from './lib/favorites.js'
   import { settings } from './lib/settings.js'
   import SettingsModal from './components/SettingsModal.svelte'
   import SmartPlaylistModal from './components/SmartPlaylistModal.svelte'
@@ -45,13 +46,13 @@
   let partyQueueSnapshot = null
   const partyAppliedIds = new Set()
   let companionVideoId = null, companionForId = null, hasVideo = false, companionRequest = 0
-  let quickPicks = [], recommendations = [], recommendationForId = null, recommendationLoading = false, recommendationRequest = 0, discoverTracks = [], discoverForId = null, discoverLoading = false, discoverRequest = 0, stats = { month: '', totalMinutes: 0, monthly: [], heavyRotation: [] }, searchQuery = '', searchResults = [], searchTimer, searchRequest = 0, searching = false, searchError = '', showCreate = false, newTitle = '', newDescription = '', preloadedTrackId = null
+  let quickPicks = [], recommendations = [], recommendationForId = null, recommendationLoading = false, recommendationRequest = 0, discoverTracks = [], discoverForId = null, discoverLoading = false, discoverRequest = 0, stats = { month: '', totalMinutes: 0, monthly: [], heavyRotation: [] }, persistentHistory = [], searchQuery = '', searchResults = [], searchTimer, searchRequest = 0, searching = false, searchError = '', showCreate = false, newTitle = '', newDescription = '', preloadedTrackId = null
   let smartPlaylists = [], smartPlaylistsLoading = false, smartPlaylistsError = '', showSmartModal = false
   let settingsOpen = false
   $: activeShell = ({ sidebar: SidebarLayout, topbar: TopbarLayout, handheld: HandheldLayout }[$settings.shellLayout] || SidebarLayout)
   let radioFilling = false, radioTopupTimer = null
   let homeView = 'home', likedTracks = [], likedLoaded = false, likedLoading = false, likedError = ''
-  let artistMixLoading = false
+  let sleepTimerId = null, sleepTimerMinutes = 0
   let libraryCached = false
   let sessionState = 'ok', playlistsLoaded = false, playlistsError = '', justSwitched = false, justSwitchTimer
   let restoring = null, sessionBannerDismissed = false, lastPersist = 0
@@ -311,9 +312,16 @@
   async function oauthStart() { oauthError = ''; oauthBusy = true; try { const response = await apiFetch('/api/auth/oauth/init', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ client_id: oauthClientId.trim(), client_secret: oauthClientSecret.trim() }) }); const data = await response.json(); if (!response.ok || data.error) throw Error(data.error); oauthDevice = data } catch (error) { oauthError = error.message } finally { oauthBusy = false } }
   async function oauthFinish() { oauthError = ''; oauthBusy = true; try { const response = await apiFetch('/api/auth/oauth/complete', { method: 'POST', headers: {'Content-Type':'application/json'} }); const data = await response.json(); if (!response.ok || data.error) throw Error(data.error); authenticated = true; sessionState = 'ok'; localStorage.setItem('ytm.session', 'ok'); oauthDevice = null; oauthCode = ''; await loadPlaylists(); await loadDiscovery() } catch (error) { oauthError = error.message } finally { oauthBusy = false } }
   async function loadDiscovery() {
-    const [quickResponse, statsResponse] = await Promise.all([apiFetch('/api/home/quick-picks'), apiFetch('/api/stats/monthly-top')])
+    const [quickResponse, statsResponse, historyResponse, artistResponse] = await Promise.all([
+      apiFetch('/api/home/quick-picks'),
+      apiFetch('/api/stats/monthly-top'),
+      apiFetch('/api/stats/recent-history'),
+      apiFetch('/api/discover/artists'),
+    ])
+    if (artistResponse.ok) mixerArtists = (await artistResponse.json()).artists || []
     if (quickResponse.ok) quickPicks = ((await quickResponse.json()).tracks || []).map(normalizeTrack).filter(Boolean)
     if (statsResponse.ok) stats = await statsResponse.json()
+    if (historyResponse.ok) persistentHistory = ((await historyResponse.json()).tracks || []).map(normalizePlayable).filter(Boolean)
     // Nothing playing yet: let the first recommendation color the page.
     if (!currentTrack && quickPicks[0]) extractAccent(quickPicks[0])
   }
@@ -417,7 +425,7 @@
     }
   }
   // --- Global entity navigation + favorite artist persistence ---
-  let favoriteArtists = [], rotationTracks = [], recentPlaylists = []
+  let favoriteArtists = [], mixerArtists = [], rotationTracks = [], recentPlaylists = []
   async function loadFavoriteArtists() {
     try {
       const response = await apiFetch('/api/artists/favorites')
@@ -517,15 +525,17 @@
     likedLoading = true
     likedError = ''
     try {
-      const response = await apiFetch('/api/liked')
+      const response = await apiFetch('/api/library/favorites')
       const data = await response.json()
       if (!response.ok || data.error) throw Error(data.error || 'Could not load favorites.')
       libraryCached = libraryCached || data.cached === true
       likedTracks = (data.tracks || []).map(normalizeTrack).filter(Boolean)
+      favoritesStore.set(likedTracks)
       likedLoaded = true
     } catch (error) {
       // Never cache a failure: keep likedLoaded false so Retry actually refetches.
       likedTracks = []
+      favoritesStore.set([])
       likedLoaded = false
       likedError = error.message || 'Could not load favorites.'
       refreshSession()
@@ -554,13 +564,12 @@
   }
   async function compileArtistMix(artists) {
     const selected = (artists || []).map(item => ({ id: item.id || null, name: clean(item.name || item.title) })).filter(item => item.name)
-    artistMixLoading = true
     if (selected.length < 2 || selected.length > 4) {
       showToast('Choose 2–4 artists to compile a mix')
       return
     }
     try {
-      const response = await apiFetch('/api/queue/artist-mix', {
+      const response = await apiFetch('/api/mix/compile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ artists: selected }),
@@ -573,8 +582,6 @@
       showToast(`Artist mix started · ${tracks.length} tracks queued`)
     } catch (error) {
       showToast(error.message || 'Could not compile artist mix')
-    } finally {
-      artistMixLoading = false
     }
   }
   async function saveTrackToPlaylist(track, playlistId = null) {
@@ -632,12 +639,25 @@
 
   function flushManualQueue() { clearManualUpcoming(); showToast('Manual queue cleared') }
 
-  function toggleTrackFavorite(track) {
+  async function toggleTrackFavorite(track) {
     const id = track?.videoId
     if (!id) return
     const exists = likedTracks.some(item => item.videoId === id)
     likedTracks = exists ? likedTracks.filter(item => item.videoId !== id) : [track, ...likedTracks]
-    showToast(exists ? 'Removed from favorites' : 'Added to favorites')
+    favoritesStore.set(likedTracks)
+    try {
+      const response = await apiFetch('/api/library/favorites/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ track }),
+      })
+      if (!response.ok) throw Error()
+      showToast(exists ? 'Removed from favorites' : 'Added to favorites')
+    } catch {
+      likedTracks = exists ? [track, ...likedTracks] : likedTracks.filter(item => item.videoId !== id)
+      favoritesStore.set(likedTracks)
+      showToast('Could not update favorites')
+    }
   }
 
   function openAddModal(track) {
@@ -901,6 +921,22 @@
     if (lyricsButton) { lyricsButton.classList.toggle('active', pipLyricsOpen); if (pipLyricsOpen && pipLyricsFor !== currentTrack?.videoId) loadPipLyrics() }
     updatePipLyricsActive()
   }
+  function setSleepTimer(minutes = 30) {
+    clearTimeout(sleepTimerId)
+    sleepTimerId = null
+    sleepTimerMinutes = Number(minutes) || 0
+    if (sleepTimerMinutes > 0) {
+      sleepTimerId = setTimeout(() => {
+        audio.pause()
+        isPlaying = false
+        sleepTimerId = null
+        sleepTimerMinutes = 0
+        showToast('Sleep timer ended')
+      }, sleepTimerMinutes * 60 * 1000)
+      showToast(`Sleep timer · ${sleepTimerMinutes} min`)
+    } else showToast('Sleep timer off')
+  }
+
   function playQueue(tracks, index = 0) {
     const normalized = (tracks || []).map(normalizePlayable).filter(Boolean)
     if (!normalized[index]) { console.warn('Cannot start queue: selected track has no video ID', tracks?.[index]); return }
@@ -939,6 +975,14 @@
     else showToast('Open on YouTube Music to browse this item')
   }
 
+  function prepareTheatreMedia(track) {
+    const videoId = track?.videoId || track?.id
+    if (!/^[A-Za-z0-9_-]{11}$/.test(String(videoId || ''))) return
+    // Deliberately do not await this: audio resolution and playback stay on
+    // their critical path while the Theatre loop warms in the background.
+    apiFetch(`/api/media/prepare?videoId=${encodeURIComponent(videoId)}`).catch(() => {})
+  }
+
   async function playTrack(track, index = 0, playlist = full) {
     track = normalizePlayable(track)
     if (!track) return
@@ -946,6 +990,7 @@
     const streamTrackId = track.canonicalId || track.videoId
     const gaplessHandoff = audio.gapFilled && track.videoId === activeQueue.nowPlaying?.videoId
     currentTrack = track; currentIndex = index; listenRecorded = false; preloadedTrackId = null; loadingTrack = true; isPlaying = true
+    prepareTheatreMedia(track)
     publishRemoteState()
     notifyPartyTrackStarted(track)
     // Unified audio-state lock: abort any in-flight stream fetch and clear both
@@ -1002,7 +1047,12 @@
       // browser never ghosts the old buffer onto the new src.
       audio.src = data.url
       audio.dataset.loadedTrackId = track.videoId
-      if (restoring && restoring.videoId === track.videoId) { audio.currentTime = Math.max(0, restoring.position || 0); restoring = null; isPlaying = false } else { await audio.play(); isPlaying = true }
+      audio.load()
+      if (restoring && restoring.videoId === track.videoId) { audio.currentTime = Math.max(0, restoring.position || 0); restoring = null; isPlaying = false } else {
+        const playPromise = audio.play()
+        if (playPromise !== undefined) playPromise.catch(error => console.warn('Playback deferred or blocked:', error))
+        isPlaying = true
+      }
     } catch (error) {
       if (requestId !== playbackRequest) return
       console.error('playTrack failed:', error)
@@ -1097,7 +1147,7 @@
       homeView = 'search'
       try { localStorage.setItem('ytm.view', 'search') } catch { /* storage is optional */ }
     }
-    Promise.resolve().then(() => input?.focus())
+    tick().then(() => input?.focus()).catch(() => {})
     searching = true
     searchTimer = setTimeout(async () => {
       try {
@@ -1207,7 +1257,7 @@
     }
     publishRemoteState()
   }
-  function next() { if (activeQueue.repeat === 'one' && currentTrack) { seekTo(0); audio.play(); return } if (duration > 0 && currentTime > 0) reportEvent(duration - currentTime <= duration * 0.2 ? 'completed' : (currentTime < 30 ? 'skipped' : null)); if (activeQueue.upNext.length) { selectNext(); return } if (activeQueue.repeat === 'all' && activeQueue.history.length) { seed([...activeQueue.history, activeQueue.nowPlaying], 0); return } if ($settings.autoRadio !== false && currentTrack) radioTopup(currentTrack, true).then(() => { if (activeQueue.upNext.length) selectNext() }) }
+  function next() { if (activeQueue.repeat === 'one' && currentTrack) { seekTo(0); const playPromise = audio.play(); if (playPromise !== undefined) playPromise.catch(error => console.warn('Playback deferred or blocked:', error)); return } if (duration > 0 && currentTime > 0) reportEvent(duration - currentTime <= duration * 0.2 ? 'completed' : (currentTime < 30 ? 'skipped' : null)); if (activeQueue.upNext.length) { selectNext(); return } if (activeQueue.repeat === 'all' && activeQueue.history.length) { seed([...activeQueue.history, activeQueue.nowPlaying], 0); return } if ($settings.autoRadio !== false && currentTrack) radioTopup(currentTrack, true).then(() => { if (activeQueue.upNext.length) selectNext() }) }
   function previous() { if (audio?.currentTime > 3) seekTo(0); else selectPrevious() }
   function jumpTo(track) { playUpcoming(track); queueOpen = false }
   function dragStart(index) { draggedIndex = index }
@@ -1284,7 +1334,7 @@
     }
     window.addEventListener('pagehide', savePlayerState)
     wireMediaSession()
-    audio.addEventListener('play', () => { isPlaying = true; syncPip(); window.__updateMediaSession?.() })
+    audio.addEventListener('play', () => { isPlaying = true; prepareTheatreMedia(currentTrack); syncPip(); window.__updateMediaSession?.() })
     audio.addEventListener('pause', () => { if (!loadingTrack) isPlaying = false; savePlayerState(); syncPip(); window.__updateMediaSession?.() })
     audio.addEventListener('timeupdate', () => { currentTime = audio.currentTime; if (currentTime >= 30) recordListen(); const now = Date.now(); if (now - lastPersist > 5000) { lastPersist = now; savePlayerState() } const upcoming = activeQueue.upNext?.[0]; if (upcoming?.videoId && preloadedTrackId !== upcoming.videoId && duration > 0 && duration - currentTime <= 20) { preloadedTrackId = upcoming.videoId; preloadNext() } syncPip(); window.__updateMediaSession?.() })
     audio.addEventListener('loadedmetadata', () => { duration = audio.duration; syncPip(); window.__updateMediaSession?.() })
@@ -1342,7 +1392,7 @@
       // offline notices handle reconciliation instead of a full-screen gate.
     } finally { checking = false }
   })
-  onDestroy(() => { unsubscribe?.(); queueUnsubscribe?.(); mixController.cancel(); clearTimeout(toastTimer); clearTimeout(justSwitchTimer); clearTimeout(remotePublishTimer); clearTimeout(searchTimer); clearTimeout(radioTopupTimer); clearInterval(remotePollTimer); clearInterval(partyPollTimer); remoteExecutedCommandIds.clear(); window.removeEventListener('pagehide', savePlayerState); audio?.pause() })
+  onDestroy(() => { unsubscribe?.(); queueUnsubscribe?.(); mixController.cancel(); clearTimeout(toastTimer); clearTimeout(justSwitchTimer); clearTimeout(remotePublishTimer); clearTimeout(searchTimer); clearTimeout(radioTopupTimer); clearTimeout(sleepTimerId); clearInterval(remotePollTimer); clearInterval(partyPollTimer); remoteExecutedCommandIds.clear(); window.removeEventListener('pagehide', savePlayerState); audio?.pause() })
 </script>
 
 <svelte:window on:keydown={handleGlobalKeydown} />
@@ -1357,7 +1407,7 @@
   {:else}  <svelte:component this={activeShell} homeView={homeView} searchQuery={searchQuery} onSearchChanged={searchChanged} onViewChange={setHomeView} onCreatePlaylist={() => showCreate = true} onOpenSmartCreator={() => showSmartModal = true} onOpenSettings={() => settingsOpen = true} playlists={playlists} onOpenPlaylist={open}>
     {#if artistData}<ArtistPage data={artistData} track={currentTrack} favorite={favoriteArtists.some(item => item.id === artistData?.browseId)} onToggleFavorite={() => toggleFavoriteArtist({ id: artistData?.browseId, name: artistData?.name, thumbnail: artistData?.thumbnail })} onPlay={(tracks) => tracks?.[0] && playQueue(tracks)} onTrack={(tracks, index) => playQueue(tracks, index)} onOpenAlbum={openAlbum} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onClose={() => artistData = null} />
     {:else if albumData}<AlbumPage data={albumData} track={currentTrack} onPlay={(tracks) => tracks?.[0] && playQueue(tracks)} onTrack={(tracks, index) => playQueue(tracks, index)} onOpenArtist={(id, name) => openArtistEntity(id, name)} onOpenArtistEntity={openArtistEntity} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onClose={() => albumData = null} />
-    {:else if full}<div in:fade={{ duration: 200 }} out:fade={{ duration: 120 }}><SongPage playlist={full} track={currentTrack} onTrack={(track, index) => { if (activeQueue.nowPlaying?.videoId === track.videoId) togglePlay(); else { seed(full.tracks, index) } }} onPlay={() => full?.tracks?.[0] && playQueue(full.tracks)} onShuffle={() => playQueueShuffled(full?.tracks)} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onRemoveTrack={removeTrackFromPlaylist} /></div>    {:else}<HomeView embedded searchQuery={searchQuery} onSearchChanged={searchChanged} searchResults={searchResults} searching={searching} searchError={searchError} homeView={homeView} onViewChange={setHomeView} sessionState={sessionState} sessionBannerDismissed={sessionBannerDismissed} onReconnect={reauthenticate} onDismissSession={() => sessionBannerDismissed = true} libraryCached={libraryCached} onDismissOffline={() => libraryCached = false} playlists={playlists} playlistsError={playlistsError} playlistsLoaded={playlistsLoaded} onRetryPlaylists={loadPlaylists} onOpenPlaylist={open} onCreatePlaylist={() => showCreate = true} onOpenSmartCreator={() => showSmartModal = true} onOpenSettings={() => settingsOpen = true} smartPlaylists={smartPlaylists} smartPlaylistsLoading={smartPlaylistsLoading} smartPlaylistsError={smartPlaylistsError} onRefreshSmart={loadSmartPlaylists} onOpenSmartPlaylist={openSmartPlaylist} stats={stats} quickPicks={quickPicks} smartMix={smartMix} recommendations={recommendations} currentTrack={currentTrack} recommendationLoading={recommendationLoading} upNext={activeQueue.upNext} history={activeQueue.history} currentTime={currentTime} duration={duration} isPlaying={isPlaying} volume={volume} loading={loadingTrack} onToggle={togglePlay} onOpenQueue={() => queueOpen = true} onOpenTheatre={() => theatreOpen = true} likedTracks={likedTracks} likedLoading={likedLoading} likedError={likedError} onRetryLiked={loadLiked} onPlayQueue={playQueue} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenBrowse={openBrowse} onArtworkLoad={extractAccent} moods={moods} activeMood={activeMood} moodPlaylists={moodPlaylists} moodLoading={moodLoading} onOpenMood={openMood} onOpenMoodPlaylist={(item) => item.browseId && open({id: item.browseId, title: item.title})} discoverTracks={discoverTracks} discoverLoading={discoverLoading} favoriteArtists={favoriteArtists} rotationTracks={rotationTracks} recentPlaylists={recentPlaylists} ytmShelves={ytmShelves} ytmFeedLoading={ytmFeedLoading} onRetryYtmFeed={loadYtmFeed} onOpenArtistEntity={openArtistEntity} onOpenAlbumEntity={openAlbumEntity} onOpenRecentPlaylist={(item) => item?.id && open({id: item.id, title: item.title})} onCompileArtistMix={compileArtistMix}/>
+    {:else if full}<div in:fade={{ duration: 200 }} out:fade={{ duration: 120 }}><SongPage playlist={full} track={currentTrack} onTrack={(track, index) => { if (activeQueue.nowPlaying?.videoId === track.videoId) togglePlay(); else { seed(full.tracks, index) } }} onPlay={() => full?.tracks?.[0] && playQueue(full.tracks)} onShuffle={() => playQueueShuffled(full?.tracks)} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onRemoveTrack={removeTrackFromPlaylist} /></div>    {:else}{#key homeView}<HomeView embedded searchQuery={searchQuery} onSearchChanged={searchChanged} searchResults={searchResults} searching={searching} searchError={searchError} homeView={homeView} onViewChange={setHomeView} sessionState={sessionState} sessionBannerDismissed={sessionBannerDismissed} onReconnect={reauthenticate} onDismissSession={() => sessionBannerDismissed = true} libraryCached={libraryCached} onDismissOffline={() => libraryCached = false} playlists={playlists} playlistsError={playlistsError} playlistsLoaded={playlistsLoaded} onRetryPlaylists={loadPlaylists} onOpenPlaylist={open} onCreatePlaylist={() => showCreate = true} onOpenSmartCreator={() => showSmartModal = true} onOpenSettings={() => settingsOpen = true} smartPlaylists={smartPlaylists} smartPlaylistsLoading={smartPlaylistsLoading} smartPlaylistsError={smartPlaylistsError} onRefreshSmart={loadSmartPlaylists} onOpenSmartPlaylist={openSmartPlaylist} stats={stats} quickPicks={quickPicks} smartMix={smartMix} recommendations={recommendations} currentTrack={currentTrack} recommendationLoading={recommendationLoading} upNext={activeQueue.upNext} history={activeQueue.history} persistentHistory={persistentHistory} currentTime={currentTime} duration={duration} isPlaying={isPlaying} volume={volume} loading={loadingTrack} onToggle={togglePlay} onOpenQueue={() => queueOpen = true} onOpenTheatre={() => theatreOpen = true} onOpenArtistEntity={openArtistEntity} onOpenAlbumEntity={openAlbumEntity} likedTracks={likedTracks} likedLoading={likedLoading} likedError={likedError} onRetryLiked={loadLiked} onPlayQueue={playQueue} onPlayTracks={playQueue} onSaveStatsPlaylist={saveQueueAsPlaylist} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenBrowse={openBrowse} onArtworkLoad={extractAccent} moods={moods} activeMood={activeMood} moodPlaylists={moodPlaylists} moodLoading={moodLoading} onOpenMood={openMood} onOpenMoodPlaylist={(item) => item.browseId && open({id: item.browseId, title: item.title})} discoverTracks={discoverTracks} discoverLoading={discoverLoading} favoriteArtists={[...mixerArtists, ...favoriteArtists]} rotationTracks={rotationTracks} recentPlaylists={recentPlaylists} ytmShelves={ytmShelves} ytmFeedLoading={ytmFeedLoading} onRetryYtmFeed={loadYtmFeed} onOpenRecentPlaylist={(item) => item?.id && open({id: item.id, title: item.title})} onCompileArtistMix={compileArtistMix}/>{/key}
     {/if}
   </svelte:component>
   {/if}
@@ -1368,7 +1418,7 @@
 {#if settingsOpen}<SettingsModal onClose={() => settingsOpen = false} onDisconnect={reauthenticate} onToast={showToast} onDataRefresh={refreshAfterAuth} />{/if}
 {#if toast}<div class="toast" role="status">{toast}</div>{/if}
 {#if dragActive}<div class="drop-overlay" aria-hidden="true"><div class="drop-card"><strong>Drop to add to your library</strong><span>mp3, flac, wav, m4a</span></div></div>{/if}
-<TransportBar track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} volume={volume} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} loading={loadingTrack} onPrevious={previous} onToggle={togglePlay} onNext={next} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onSeek={seek} onVolume={setVolume} onQueue={() => queueOpen = !queueOpen} onTheatre={() => theatreOpen = true} onPip={togglePip} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenArtist={openArtistEntity} />  {#if theatreOpen}<TheatreMode track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} hasVideo={hasVideo} companionVideoId={companionVideoId} history={activeQueue.history} upNext={activeQueue.upNext} recommendations={recommendations} onClose={() => theatreOpen = false} party={partyRoom} partyPopoverOpen={partyPopoverOpen} partySetupOpen={partySetupOpen} onPartyOpen={openPartyPopover} onPartyLaunch={launchParty} onPartyApprove={onPartyApprove} onPartyReject={onPartyReject} onPartyRole={onPartyRole} onPartyKick={onPartyKick} onPartySetting={onPartySetting} onPartyCopyInvite={onPartyCopyInvite} onPartyEnd={endParty} queueOpen={queueOpen} onQueue={() => queueOpen = !queueOpen} onToggle={togglePlay} onNext={next} onPrevious={previous} onSeek={seek} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onPlayQueue={jumpTo} onPlayRecommendation={startMix} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onSaveToPlaylist={saveTrackToPlaylist} onSaveQueueAsPlaylist={saveQueueAsPlaylist} playlists={playlists} onCreatePlaylist={createPlaylistFromName} onFavorite={toggleTrackFavorite} onRemoveUpcoming={(track) => removeUpcoming(track?.videoId)} onClearQueue={clearUpcoming} onClearManualQueue={flushManualQueue} onReorder={(from, to) => reorderUpcoming(from, to)} onStartMix={startMix} />{/if}
+<TransportBar track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} volume={volume} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} loading={loadingTrack} onPrevious={previous} onToggle={togglePlay} onNext={next} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onSeek={seek} onVolume={setVolume} onQueue={() => queueOpen = !queueOpen} onTheatre={() => theatreOpen = true} onPartyOpen={openPartyPopover} onSleepTimer={setSleepTimer} onPip={togglePip} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} onOpenArtist={openArtistEntity} />  {#if theatreOpen}<TheatreMode track={currentTrack} isPlaying={isPlaying} currentTime={currentTime} duration={duration} volume={volume} onVolume={setVolume} shuffle={activeQueue.shuffle} repeat={activeQueue.repeat} hasVideo={hasVideo} companionVideoId={companionVideoId} history={activeQueue.history} upNext={activeQueue.upNext} recommendations={recommendations} onClose={() => theatreOpen = false} party={partyRoom} partyPopoverOpen={partyPopoverOpen} partySetupOpen={partySetupOpen} onPartyOpen={openPartyPopover} onPartyLaunch={launchParty} onPartyApprove={onPartyApprove} onPartyReject={onPartyReject} onPartyRole={onPartyRole} onPartyKick={onPartyKick} onPartySetting={onPartySetting} onPartyCopyInvite={onPartyCopyInvite} onPartyEnd={endParty} onSleepTimer={setSleepTimer} queueOpen={queueOpen} onQueue={() => queueOpen = !queueOpen} onToggle={togglePlay} onNext={next} onPrevious={previous} onSeek={seek} onShuffle={toggleShuffle} onRepeat={cycleRepeat} onPlayQueue={jumpTo} onPlayRecommendation={startMix} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onSaveToPlaylist={saveTrackToPlaylist} onSaveQueueAsPlaylist={saveQueueAsPlaylist} playlists={playlists} onCreatePlaylist={createPlaylistFromName} onFavorite={toggleTrackFavorite} onRemoveUpcoming={(track) => removeUpcoming(track?.videoId)} onClearQueue={clearUpcoming} onClearManualQueue={flushManualQueue} onReorder={(from, to) => reorderUpcoming(from, to)} onStartMix={startMix} />{/if}
 {#if queueOpen && !theatreOpen}<aside class="queue-drawer" class:over-theatre={theatreOpen} aria-label="Playback queue"><div class="queue-head"><h2>Playback Manager</h2><button class="queue-close" on:pointerdown|preventDefault={() => queueOpen = false} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); queueOpen = false } }} aria-label="Close queue" title="Close queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18 18 6M6 6l12 12"></path></svg></button></div><div class="queue-tabs" role="tablist" aria-label="Playback manager views"><button class:active={queueTab === 'queue'} role="tab" aria-selected={queueTab === 'queue'} on:click={() => queueTab = 'queue'}>Up Next <span>{activeQueue.upNext.length}</span></button><button class:active={queueTab === 'recommendations'} role="tab" aria-selected={queueTab === 'recommendations'} on:click={() => queueTab = 'recommendations'}>Recommended <span>{recommendations.length}</span></button></div>{#if queueTab === 'queue'}<div class="queue-section"><h3>History <span>{activeQueue.history.length}</span></h3>{#if activeQueue.history.length}<div class="history-row"><span class="queue-art">{#if activeQueue.history.at(-1).thumbnail}<img src={activeQueue.history.at(-1).thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="queue-title">{clean(activeQueue.history.at(-1).title)}<small>{clean(activeQueue.history.at(-1).artist)}</small></span></div>{:else}<p class="empty">Nothing played yet</p>{/if}</div><div class="queue-section upcoming"><div class="upcoming-head"><h3>Up Next <span>{activeQueue.upNext.length}</span></h3><button on:click={clearUpcoming} disabled={!activeQueue.upNext.length}>Clear</button></div>{#each activeQueue.upNext as item, index (item.videoId)}<div class="queue-row" class:dragging={draggedIndex === index} role="listitem" draggable="true" on:dragstart={() => dragStart(index)} on:dragend={() => draggedIndex = -1} on:dragover|preventDefault on:drop={() => dropAt(index)}><span class="grip">⋮⋮</span><button class="queue-item" on:click={() => jumpTo(item)}><span class="queue-art">{#if item.thumbnail}<img src={item.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="queue-title">{clean(item.title)}<small>{clean(item.artist)}</small></span></button><button class="remove" on:click={() => removeUpcoming(item.videoId)} aria-label="Remove {clean(item.title)}">×</button><TrackContextMenu track={item} onPlayNext={playNextTrack} onAddToQueue={appendTrack} onAddToPlaylist={openAddModal} onStartMix={startMix} /></div>{/each}{#if !activeQueue.upNext.length}<p class="empty">Queue is empty</p>{/if}</div>{:else}<div class="queue-recommendations">{#if recommendations.length}{#each recommendations as rec, index (rec.videoId || index)}<div class="queue-recommendation-row mixable-track"><button class="queue-item" on:click={() => playQueue([rec])}><span class="queue-art">{#if rec.thumbnail}<img src={rec.thumbnail} referrerpolicy="no-referrer" alt="" />{:else}<span>♫</span>{/if}</span><span class="queue-title">{clean(rec.title)}<small>{clean(rec.artist)}</small></span></button><button class="queue-add" on:click={() => appendTrack(rec)} aria-label="Add {clean(rec.title)} to queue">＋</button><StartMixButton track={rec} onStartMix={startMix} /></div>{/each}{:else}<div class="queue-empty-state"><strong>No recommendations loaded</strong><span>Play a track to discover similar songs.</span></div>{/if}</div>{/if}</aside>{/if}
 
 <style>

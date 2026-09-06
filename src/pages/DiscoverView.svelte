@@ -4,7 +4,8 @@
   export let tracks = []
   export let favoriteArtists = []
   export let history = []
-  export let loading = false
+  export let persistentHistory = []
+  export let stats = { monthly: [], heavyRotation: [] }
   export let onCompileMix = () => {}
   export let onPlay = () => {}
   export let onOpenArtist = () => {}
@@ -13,156 +14,161 @@
 
   let selected = []
   let query = ''
+  let compiling = false
+  let tunesContainer
+
+  function scrollTunes(direction) {
+    if (!tunesContainer) return
+    const offset = tunesContainer.clientWidth * 0.75
+    tunesContainer.scrollBy({
+      left: direction === 'left' ? -offset : offset,
+      behavior: 'smooth',
+    })
+  }
 
   const clean = value => String(value ?? '').replace(/[\\\n\r\t]+/g, ' ').replace(/\s+/g, ' ').trim()
-  const entityKey = item => item?.id || item?.browseId || clean(item?.name).toLowerCase()
-  const entityName = item => typeof item === 'string' ? item : item?.name || item?.title || ''
+  const entityName = item => typeof item === 'string' ? clean(item) : clean(item?.name || item?.title || item?.artist)
+  const entityId = item => typeof item === 'object' ? item?.id || item?.browseId || null : null
+  const entityKey = item => String(entityId(item) || entityName(item).toLowerCase())
+  const artistEntries = item => {
+    const value = item?.artists || item?.artist || item?.author
+    return Array.isArray(value) ? value : value ? [value] : []
+  }
+  const trackKey = item => item?.videoId || item?.id || `${item?.title}-${item?.artist}`
 
-  $: libraryArtists = [...new Map([
-    ...favoriteArtists,
-    ...history.flatMap(item => Array.isArray(item?.artists) ? item.artists : [{ name: item?.artist }]),
-  ].filter(item => entityName(item)).map(item => [entityKey(item), item])).values()]
-  $: filteredArtists = libraryArtists.filter(item => clean(entityName(item)).toLowerCase().includes(query.trim().toLowerCase()))
-  $: targetArtist = selected[0] || libraryArtists[0] || null
-  $: targetName = clean(entityName(targetArtist))
-  $: artistTracks = targetName ? tracks.filter(item => clean(item?.artist).toLowerCase().includes(targetName.toLowerCase())) : []
-  $: architects = [...new Map(artistTracks.flatMap(item => {
-    const value = item?.producers || item?.producer || []
-    return Array.isArray(value) ? value : [value]
-  }).filter(Boolean).map(item => [entityKey(item), item])).values()]
-  $: collaborators = [...new Map(artistTracks.flatMap(item => {
-    const value = item?.features || item?.collaborators || []
-    return Array.isArray(value) ? value : [value]
-  }).filter(Boolean).map(item => [entityKey(item), item])).values()]
-  $: freshDrops = tracks.filter(item => item?.releaseDate || item?.releasedAt || item?.isNew).slice(0, 12)
+  $: sourceArtists = Array.from(new Map([
+    ...(Array.isArray(favoriteArtists) ? favoriteArtists : []),
+    ...(Array.isArray(stats?.monthly) ? stats.monthly.flatMap(item => artistEntries(item)) : []),
+    ...(Array.isArray(persistentHistory) ? persistentHistory.flatMap(item => artistEntries(item)) : []),
+    ...(Array.isArray(history) ? history.flatMap(item => artistEntries(item)) : []),
+  ].map(item => [entityKey(item), item]).filter(([key, item]) => entityName(item) && key !== '')).values())
+  $: libraryArtists = sourceArtists.map(item => ({
+    name: entityName(item),
+    id: entityId(item),
+    thumbnail: item?.thumbnail || item?.thumbnail_url || item?.thumbnails?.at?.(-1)?.url || null,
+  }))
+  $: filteredArtists = libraryArtists.filter(item => item.name.toLowerCase().includes(query.trim().toLowerCase()))
+  $: allTracks = [...new Map([...(Array.isArray(tracks) ? tracks : []), ...(Array.isArray(persistentHistory) ? persistentHistory : [])].filter(item => trackKey(item)).map(item => [trackKey(item), item])).values()]
+  $: freshDrops = allTracks.filter(item => item?.releaseDate || item?.releasedAt || item?.isNew).slice(0, 12)
+  $: discoveryTracks = allTracks.slice(0, 12)
+
+  function isSelected(artist) {
+    return selected.some(item => entityKey(item) === entityKey(artist))
+  }
 
   function toggleArtist(artist) {
     const key = entityKey(artist)
     if (selected.some(item => entityKey(item) === key)) {
       selected = selected.filter(item => entityKey(item) !== key)
-      return
+    } else if (selected.length < 4) {
+      selected = [...selected, artist]
     }
-    if (selected.length < 4) selected = [...selected, artist]
   }
 
-  function compile() {
-    if (selected.length < 2) return
-    onCompileMix(selected)
+  function removeArtist(artist) {
+    selected = selected.filter(item => entityKey(item) !== entityKey(artist))
+  }
+
+  function addFirstAvailableArtist() {
+    const artist = filteredArtists.find(item => !isSelected(item))
+    if (artist) toggleArtist(artist)
+  }
+
+  async function compile() {
+    if (selected.length < 2 || compiling) return
+    compiling = true
+    try {
+      await onCompileMix(selected)
+    } finally {
+      compiling = false
+    }
   }
 
   function openPerson(person) {
-    onOpenArtist(person?.id || person?.browseId || null, entityName(person))
+    onOpenArtist(entityId(person), entityName(person))
   }
 </script>
 
 <section class="discover-page" aria-labelledby="discover-title">
-  <header class="page-header">
-    <div>
-      <p class="eyebrow">DISCOVERY WORKSPACE</p>
-      <h1 id="discover-title">Discover</h1>
-      <p class="lede">Build a deliberate next listen from the artists already shaping your library.</p>
-    </div>
-    <span class="data-tag">{tracks.length} TRACKS IN FIELD</span>
-  </header>
-
-  <section class="compile-bar" aria-label="Compile a mix">
-    <div>
-      <p class="eyebrow">STATION MATRIX</p>
-      <h2>Compile a mix</h2>
-      <p>Choose 2–4 artists. The queue will alternate between their catalogs.</p>
-    </div>
-    <button class="compile-button" disabled={selected.length < 2 || loading} on:click={compile}>
-      {#if loading}<span class="spinner" aria-hidden="true"></span>Compiling…{:else}Compile Mix <span>{selected.length}/4</span>{/if}
-    </button>
-  </section>
-
-  <section class="artist-picker" aria-labelledby="signal-title">
-    <div class="picker-head">
-      <div>
-        <h2 id="signal-title">Signal sources</h2>
-        <p>{selected.length === 0 ? 'Select at least two artists' : `${selected.length} selected`}</p>
+  <section class="tunes-panel" aria-labelledby="tunes-title">
+    <header class="section-head">
+      <h1 id="tunes-title">Tunes to Discover</h1>
+      {#if discoveryTracks.length}
+        <div class="tunes-navigation">
+          <span class="data-tag">{discoveryTracks.length} TRACKS</span>
+          <div class="carousel-arrows">
+            <button type="button" class="carousel-arrow" on:click={() => scrollTunes('left')} aria-label="Scroll left">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m15 19-7-7 7-7" /></svg>
+            </button>
+            <button type="button" class="carousel-arrow" on:click={() => scrollTunes('right')} aria-label="Scroll right">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 5 7 7-7 7" /></svg>
+            </button>
+          </div>
+        </div>
+      {/if}
+    </header>
+    {#if freshDrops.length}
+      <div class="drop-strip" aria-label="Fresh drops">
+        {#each freshDrops.slice(0, 4) as item, index (`${trackKey(item)}-${index}`)}
+          <TrackCard track={item} compact onPlay={onPlay} onOpenArtist={onOpenArtist} onOpenAlbum={onOpenAlbum} onAdd={onAddToQueue} />
+        {/each}
       </div>
-      <input bind:value={query} type="search" placeholder="Filter artists" aria-label="Filter artists" />
-    </div>
-    <div class="artist-chips">
-      {#each filteredArtists as artist (entityKey(artist))}
-        <button class:selected={selected.some(item => entityKey(item) === entityKey(artist))} on:click={() => toggleArtist(artist)}>
-          <span aria-hidden="true">♩</span>
-          {clean(entityName(artist))}
-          {#if selected.some(item => entityKey(item) === entityKey(artist))}<b aria-hidden="true">✓</b>{/if}
-        </button>
-      {:else}
-        <p class="empty">No artists from your listening history match that search.</p>
-      {/each}
-    </div>
-    {#if selected.length === 1}
-      <p class="validation">Choose one more artist to compile a balanced mix.</p>
-    {:else if selected.length >= 4}
-      <p class="validation">Four artists selected — remove one before choosing another.</p>
+    {/if}
+    {#if discoveryTracks.length}
+      <div class="track-grid" bind:this={tunesContainer}>
+        {#each discoveryTracks as item, index (`${trackKey(item)}-${index}`)}
+          <div class="tune-card">
+            <TrackCard track={item} onPlay={onPlay} onOpenArtist={onOpenArtist} onOpenAlbum={onOpenAlbum} onAdd={onAddToQueue} />
+          </div>
+        {/each}
+      </div>
     {/if}
   </section>
 
-  <section class="node-workspace" aria-labelledby="nodes-title">
-    <div class="node-header">
-      <div>
-        <p class="eyebrow">CONNECTION NODES</p>
-        <h2 id="nodes-title">{targetArtist ? `The network around ${targetName}` : 'Choose a target artist'}</h2>
-      </div>
-      <span class="data-tag">{targetArtist ? 'ACTIVE TARGET' : 'NO TARGET'}</span>
-    </div>
-    <div class="node-grid">
-      <section class="node-panel" aria-labelledby="architects-title">
-        <header>
-          <span class="node-index">01</span>
-          <div><h3 id="architects-title">Architects</h3><p>Producers and beatmakers</p></div>
-        </header>
-        {#if architects.length}
-          <ul>
-            {#each architects as person (entityKey(person))}
-              <li><button on:click={() => openPerson(person)}>{clean(entityName(person))}</button><span>producer</span></li>
-            {/each}
-          </ul>
-        {:else}
-          <p class="empty">Producer credits will appear when the provider returns them for this catalog.</p>
-        {/if}
-      </section>
+  <section class="mixer-panel" aria-labelledby="mixer-title">
+    <header class="mixer-head">
+      <h2 id="mixer-title">Multi-Artist Mixer Desk</h2>
+      <button class="compile-button" disabled={selected.length < 2 || compiling} on:click={compile} aria-label="Compile selected artists">
+        {#if compiling}<span class="spinner" aria-hidden="true"></span>{/if}
+        <span class="mixer-glyph" aria-hidden="true">⧉</span>
+        <span>{compiling ? 'Compiling…' : 'Compile Mix'}</span>
+      </button>
+    </header>
 
-      <section class="node-panel" aria-labelledby="collaborators-title">
-        <header>
-          <span class="node-index">02</span>
-          <div><h3 id="collaborators-title">Collaborators</h3><p>Features and scene peers</p></div>
-        </header>
-        {#if collaborators.length}
-          <ul>
-            {#each collaborators as person (entityKey(person))}
-              <li><button on:click={() => openPerson(person)}>{clean(entityName(person))}</button><span>collaborator</span></li>
-            {/each}
-          </ul>
+    <div class="mix-slots" aria-label="Selected artists">
+      {#each Array(4) as _, index}
+        {#if selected[index]}
+          <button class="mix-slot filled" on:click={() => removeArtist(selected[index])} aria-label="Remove {selected[index].name} from mix">
+            {#if selected[index].thumbnail}<img src={selected[index].thumbnail} alt="" referrerpolicy="no-referrer" />{/if}
+            <span>{selected[index].name}</span><b aria-hidden="true">×</b>
+          </button>
         {:else}
-          <p class="empty">Collaborator data will populate from enriched artist metadata.</p>
+          <button class="mix-slot empty-slot" on:click={addFirstAvailableArtist} aria-label="Add an artist to slot {index + 1}"><span aria-hidden="true">＋</span></button>
         {/if}
-      </section>
+      {/each}
     </div>
-  </section>
 
-  <section class="drops" aria-labelledby="drops-title">
-    <div class="section-label">
-      <div><p class="eyebrow">FRESH DROPS</p><h2 id="drops-title">New in your orbit</h2></div>
-      <span class="data-tag">LAST 30 DAYS</span>
-    </div>
-    {#if freshDrops.length}
-      <div class="drop-grid">
-        {#each freshDrops as item (item.videoId || item.id)}
-          <TrackCard track={item} onPlay={onPlay} onOpenArtist={onOpenArtist} onOpenAlbum={onOpenAlbum} onAdd={onAddToQueue} />
-        {/each}
+    <div class="artist-source">
+      <div class="source-head"><h3>Artists</h3><input bind:value={query} type="search" placeholder="Search artists" aria-label="Search library artists" /></div>
+      <div class="artist-strip">
+        {#each filteredArtists as artist, index (`${entityKey(artist)}-${index}`)}
+          <button class:selected={isSelected(artist)} class="artist-avatar" on:click={() => toggleArtist(artist)} aria-pressed={isSelected(artist)} title={artist.name}>
+            {#if artist.thumbnail}
+              <img src={artist.thumbnail} alt={artist.name} referrerpolicy="no-referrer" on:error={(event) => event.currentTarget.hidden = true} />
+            {/if}
+            <span class="avatar-fallback" aria-hidden="true">{clean(artist.name).charAt(0).toUpperCase() || '♩'}</span>
+            <small>{artist.name}</small>
+          </button>
+        {:else}<span class="no-results">No results</span>{/each}
       </div>
-    {:else}
-      <p class="empty">New releases from artists in your library will land here as the feed supplies release dates.</p>
+    </div>
+
+    {#if selected.length >= 2}
+      <div class="selected-summary"><span>{selected.length}/4 selected</span><span>Round-robin queue ready</span></div>
     {/if}
   </section>
 </section>
 
 <style>
-  .discover-page{min-height:100%;box-sizing:border-box;padding:30px clamp(18px,4vw,48px) 46px;color:#ededed;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
-  .page-header,.picker-head,.node-header,.section-label{display:flex;align-items:flex-end;justify-content:space-between;gap:18px}.page-header{margin-bottom:26px}.eyebrow,.data-tag{margin:0 0 8px;color:#71717a;font:600 .64rem ui-monospace,SFMono-Regular,monospace;letter-spacing:.14em}.page-header h1{margin:0;font-size:clamp(2rem,4vw,3rem);letter-spacing:-.055em}.lede{margin:7px 0 0;color:#71717a;font-size:.78rem}.compile-bar,.artist-picker,.node-workspace,.drops{border:1px solid rgba(255,255,255,.07);background:#09090b;border-radius:12px}.compile-bar{display:flex;align-items:center;justify-content:space-between;gap:22px;padding:20px;margin-bottom:14px}.compile-bar h2,.node-header h2,.section-label h2{margin:0;font-size:1.08rem;letter-spacing:-.03em}.compile-bar p:not(.eyebrow),.picker-head p,.node-panel header p{margin:6px 0 0;color:#71717a;font-size:.74rem}.compile-button{display:inline-flex;align-items:center;gap:8px;border:1px solid #ededed;border-radius:999px;padding:10px 16px;color:#09090b;background:#ededed;cursor:pointer;font-weight:700;white-space:nowrap}.compile-button:disabled{opacity:.38;cursor:not-allowed}.compile-button span{font:500 .64rem ui-monospace,SFMono-Regular,monospace}.spinner{width:12px;height:12px;border:2px solid #09090b33;border-top-color:#09090b;border-radius:50%;animation:spin .7s linear infinite}.artist-picker{padding:17px;margin-bottom:14px}.picker-head h2{margin:0;font-size:.95rem}.picker-head input{width:min(220px,44vw);border:1px solid rgba(255,255,255,.09);border-radius:8px;padding:9px 11px;color:#ededed;background:#111113;outline:none}.picker-head input:focus{border-color:#ededed}.artist-chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:15px}.artist-chips button{display:inline-flex;align-items:center;gap:7px;border:1px solid rgba(255,255,255,.08);border-radius:999px;padding:8px 11px;color:#a1a1aa;background:#111113;cursor:pointer;font-size:.72rem}.artist-chips button:hover,.artist-chips button.selected{color:#ededed;border-color:rgba(255,255,255,.28)}.artist-chips button.selected{background:#ededed;color:#09090b}.artist-chips b{font-size:.68rem}.validation{margin:12px 0 0;color:#a1a1aa;font-size:.7rem}.node-workspace{padding:18px;margin-bottom:14px}.node-header{margin-bottom:16px}.node-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.node-panel{min-height:170px;padding:15px;border:1px solid rgba(255,255,255,.06);border-radius:10px;background:#0c0c0f}.node-panel header{display:flex;align-items:center;gap:10px;padding-bottom:12px;border-bottom:1px solid rgba(255,255,255,.06)}.node-index{color:#71717a;font:500 .65rem ui-monospace,SFMono-Regular,monospace}.node-panel h3{margin:0;font-size:.85rem}.node-panel ul{margin:12px 0 0;padding:0;list-style:none}.node-panel li{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.04)}.node-panel li:last-child{border-bottom:0}.node-panel li button{border:0;padding:0;color:#ededed;background:none;cursor:pointer;font:inherit;font-size:.75rem}.node-panel li button:hover{text-decoration:underline}.node-panel li span{color:#52525b;font:500 .6rem ui-monospace,SFMono-Regular,monospace}.drops{padding:18px}.section-label{align-items:center}.drop-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:16px;margin-top:16px}.empty{color:#71717a;font-size:.76rem}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:700px){.page-header,.compile-bar,.picker-head,.node-header{align-items:flex-start;flex-direction:column}.compile-button{width:100%;justify-content:center}.picker-head input{width:100%}.node-grid{grid-template-columns:1fr}.discover-page{padding:22px 16px 36px}}
+  .discover-page{display:flex;flex-direction:column;gap:12px;min-height:100%;box-sizing:border-box;padding:18px clamp(16px,3vw,42px) 34px;color:#ededed;background:#000;font-family:Inter,ui-sans-serif,system-ui,sans-serif}.tunes-panel,.mixer-panel{min-height:0;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:#050505;padding:16px}.tunes-panel{flex:1 1 50%;overflow:hidden}.mixer-panel{flex:1 1 50%}.section-head,.mixer-head,.source-head{display:flex;align-items:center;justify-content:space-between;gap:14px}.section-head h1,.mixer-head h2{margin:0;font-size:1.1rem;letter-spacing:-.045em}.tunes-navigation{display:flex;align-items:center;gap:12px}.data-tag{color:#71717a;font:600 .6rem ui-monospace,SFMono-Regular,monospace;letter-spacing:.12em}.carousel-arrows{display:flex;align-items:center;gap:4px}.carousel-arrow{display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:50%;color:#d4d4d8;background:rgba(255,255,255,.05);cursor:pointer;transition:background .18s ease,color .18s ease}.carousel-arrow:hover{color:#fff;background:rgba(255,255,255,.15)}.carousel-arrow svg{width:16px;height:16px;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round;stroke-width:2}.drop-strip{display:flex;gap:8px;overflow-x:auto;margin-top:14px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.06);scrollbar-width:none}.drop-strip::-webkit-scrollbar{display:none}.drop-strip :global(.compact-card){min-width:215px}.track-grid{display:flex;flex-wrap:nowrap;gap:16px;margin-top:14px;overflow-x:auto;scroll-behavior:smooth;scrollbar-width:none;-ms-overflow-style:none;user-select:none;padding:2px 2px 12px}.track-grid::-webkit-scrollbar{display:none}.tune-card{flex:0 0 9rem;width:9rem}.compile-button{display:inline-flex;align-items:center;gap:7px;border:1px solid #ededed;border-radius:999px;padding:8px 13px;color:#080808;background:#ededed;cursor:pointer;font-size:.7rem;font-weight:750}.compile-button:disabled{opacity:.34;cursor:not-allowed}.mixer-glyph{font-size:1rem;line-height:1}.spinner{width:11px;height:11px;border:2px solid #0004;border-top-color:#000;border-radius:50%;animation:spin .7s linear infinite}.mix-slots{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:18px}.mix-slot{display:flex;align-items:center;justify-content:center;gap:7px;min-width:0;min-height:42px;padding:7px 9px;border:1px dashed rgba(255,255,255,.22);border-radius:9px;color:#71717a;background:transparent;cursor:pointer}.mix-slot.filled{border-style:solid;border-color:rgba(255,255,255,.25);color:#ededed;background:#111113}.mix-slot img{width:24px;height:24px;flex:0 0 auto;object-fit:cover;border-radius:50%}.mix-slot span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.68rem}.mix-slot b{color:#71717a;font-size:1rem;font-weight:400}.empty-slot span{font-size:1rem}.artist-source{margin-top:18px;padding-top:14px;border-top:1px solid rgba(255,255,255,.07)}.source-head h3{margin:0;color:#a1a1aa;font-size:.76rem}.source-head input{width:min(240px,48%);padding:8px 10px;border:1px solid rgba(255,255,255,.09);border-radius:7px;outline:0;color:#ededed;background:#111113;font-size:.7rem}.source-head input:focus{border-color:#ededed}.artist-strip{display:flex;gap:14px;overflow-x:auto;margin-top:13px;padding:2px 2px 8px;scrollbar-width:none}.artist-strip::-webkit-scrollbar{display:none}.artist-avatar{display:flex;flex:0 0 58px;flex-direction:column;align-items:center;gap:5px;border:0;padding:0;color:#71717a;background:transparent;cursor:pointer}.artist-avatar{position:relative}.artist-avatar img,.artist-avatar .avatar-fallback{display:grid;place-items:center;width:52px;height:52px;overflow:hidden;border:1px solid rgba(255,255,255,.1);border-radius:50%;color:#a1a1aa;background:#17171a;object-fit:cover}.artist-avatar img{position:relative;z-index:1}.artist-avatar .avatar-fallback{position:absolute;top:0;left:50%;transform:translateX(-50%);font-size:1rem;font-weight:700}.artist-avatar.selected img,.artist-avatar.selected .avatar-fallback{border-color:#ededed;box-shadow:0 0 0 2px #000,0 0 0 3px #ededed}.artist-avatar small{width:58px;overflow:hidden;color:#71717a;text-overflow:ellipsis;white-space:nowrap;text-align:center;font-size:.58rem}.artist-avatar.selected small{color:#ededed}.no-results{color:#71717a;font:500 .68rem ui-monospace,SFMono-Regular,monospace}.selected-summary{display:flex;justify-content:space-between;margin-top:14px;color:#71717a;font:500 .62rem ui-monospace,SFMono-Regular,monospace}.selected-summary span:last-child{color:#a1a1aa}@keyframes spin{to{transform:rotate(360deg)}}@media(min-width:640px){.tune-card{flex-basis:10rem;width:10rem}}@media(max-width:700px){.discover-page{padding-inline:12px}.tunes-panel,.mixer-panel{flex-basis:auto}.tunes-panel{min-height:48vh}.mixer-panel{min-height:48vh}.mix-slots{gap:5px}.mix-slot{padding-inline:4px}.source-head input{width:52%}}
 </style>

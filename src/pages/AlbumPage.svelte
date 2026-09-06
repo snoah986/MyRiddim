@@ -15,6 +15,18 @@
   function onKeydown(event) { if (event.key === 'Escape') { event.preventDefault(); onClose() } }
   onMount(() => window.addEventListener('keydown', onKeydown))
   onDestroy(() => window.removeEventListener('keydown', onKeydown))
+  let contextTrack = null
+  let contextX = 0
+  let contextY = 0
+  let contextKey = 0
+  function openContext(event, item) {
+    event.preventDefault()
+    event.stopPropagation()
+    contextTrack = item
+    contextX = event.clientX
+    contextY = event.clientY
+    contextKey += 1
+  }
   const tracks = () => data?.tracks || []
   const formatDuration = seconds => {
     if (!Number.isFinite(seconds) || seconds <= 0) return ''
@@ -25,10 +37,11 @@
 
 <svelte:window on:keydown={onKeydown} />
 <div class="albumpage" role="dialog" aria-modal="true" aria-label={data?.title ?? 'Album'}>
+  {#if contextTrack}<TrackContextMenu key={contextKey} track={contextTrack} positioned x={contextX} y={contextY} autoOpen onPlayNext={onPlayNext} onAddToQueue={onAddToQueue} onAddToPlaylist={onAddToPlaylist} onStartMix={onStartMix} />{/if}
   <header class="topbar"><button class="icon-btn" on:click={onClose} aria-label="Back" title="Back (Esc)">←</button><div class="crumb">{clean(data?.type) || 'ALBUM'}</div><button class="exit" on:click={onClose} aria-label="Exit" title="Exit (Esc)">Exit</button></header>
   <div class="layout">
     <aside class="details"><div class="cover">{#if data?.thumbnail}<img src={data.thumbnail} referrerpolicy="no-referrer" alt="{clean(data.title)} artwork" />{:else}<span>♫</span>{/if}</div><h1>{clean(data?.title) || 'Album'}</h1>{#if data?.artist}<button class="artist" on:click={onOpenArtist}>{clean(data.artist)}</button>{/if}<p class="summary">{#if data?.year}<span class="count">{clean(data.year)}</span>{/if}<span>{data?.trackCount ?? tracks().length} songs</span>{#if data?.durationSeconds}<span>· {formatDuration(data.durationSeconds)}</span>{/if}</p>{#if tracks().length}<button class="play" on:click={() => onPlay(tracks())} aria-label="Play album">▶ <span>Play</span></button>{/if}</aside>
-    <section class="tracks" aria-label="Album tracks"><div class="track-head"><span>#</span><span>Title</span><span>Artist</span><span>Time</span><span></span></div>{#each tracks() as t, i (t.videoId)}<div class="track" role="button" tabindex="0" class:active={track && track.videoId === t.videoId} on:click={() => onTrack(tracks(), i)} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onTrack(tracks(), i) } }}><span class="num">{track && track.videoId === t.videoId ? '♪' : i + 1}</span><span class="meta"><span class="title">{clean(t.title)}</span><span class="sub">{clean(t.album)}</span></span><span class="artist">{clean(t.artist) || '—'}</span><span class="dur">{t.duration || '—'}</span><TrackContextMenu track={t} onPlayNext={onPlayNext} onAddToQueue={onAddToQueue} onAddToPlaylist={onAddToPlaylist} onStartMix={onStartMix} /></div>{/each}</section>
+    <section class="tracks" aria-label="Album tracks"><div class="track-head"><span>#</span><span>Title</span><span>Artist</span><span>Time</span><span></span></div>{#each tracks() as t, i (t.videoId)}<div class="track" role="button" tabindex="0" class:active={track && track.videoId === t.videoId} on:click={() => onTrack(tracks(), i)} on:contextmenu={(event) => openContext(event, t)} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onTrack(tracks(), i) } }}><span class="num">{track && track.videoId === t.videoId ? '♪' : i + 1}</span><span class="meta"><span class="title">{clean(t.title)}</span><span class="sub">{clean(t.album)}</span></span><span class="artist">{clean(t.artist) || '—'}</span><span class="dur">{t.duration || '—'}</span><TrackContextMenu track={t} onPlayNext={onPlayNext} onAddToQueue={onAddToQueue} onAddToPlaylist={onAddToPlaylist} onStartMix={onStartMix} /></div>{/each}</section>
   </div>
 </div>
 

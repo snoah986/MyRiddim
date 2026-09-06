@@ -29,9 +29,9 @@ jobs:
         shell: pwsh
         run: |
           pip install -r backend/requirements.txt pyinstaller
-          pyinstaller --noconfirm --onefile --windowed --name "backend-x86_64-pc-windows-msvc" backend/app.py
+          pyinstaller --noconfirm --onefile --windowed --name "ytm-backend-x86_64-pc-windows-msvc" backend/app.py
           New-Item -ItemType Directory -Force -Path "src-tauri/binaries"
-          Copy-Item "dist/backend-x86_64-pc-windows-msvc.exe" "src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe"
+          Copy-Item "dist/ytm-backend-x86_64-pc-windows-msvc.exe" "src-tauri/binaries/ytm-backend-x86_64-pc-windows-msvc.exe"
 
       - name: Install Node Dependencies
         run: npm install
