@@ -49,8 +49,8 @@
   }))
   $: filteredArtists = libraryArtists.filter(item => item.name.toLowerCase().includes(query.trim().toLowerCase()))
   $: allTracks = [...new Map([...(Array.isArray(tracks) ? tracks : []), ...(Array.isArray(persistentHistory) ? persistentHistory : [])].filter(item => trackKey(item)).map(item => [trackKey(item), item])).values()]
-  $: freshDrops = allTracks.filter(item => item?.releaseDate || item?.releasedAt || item?.isNew).slice(0, 12)
-  $: discoveryTracks = allTracks.slice(0, 12)
+  $: freshDrops = allTracks.filter(item => item?.releaseDate || item?.releasedAt || item?.isNew)
+  $: discoveryTracks = allTracks
 
   function isSelected(artist) {
     return selected.some(item => entityKey(item) === entityKey(artist))
@@ -109,7 +109,7 @@
     </header>
     {#if freshDrops.length}
       <div class="drop-strip" aria-label="Fresh drops">
-        {#each freshDrops.slice(0, 4) as item, index (`${trackKey(item)}-${index}`)}
+        {#each freshDrops as item, index (`${trackKey(item)}-${index}`)}
           <TrackCard track={item} compact onPlay={onPlay} onOpenArtist={onOpenArtist} onOpenAlbum={onOpenAlbum} onAdd={onAddToQueue} />
         {/each}
       </div>

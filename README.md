@@ -2,6 +2,10 @@
 
 A local-first YouTube Music desktop client: Svelte UI, a Flask/ytmusicapi bridge, a low-latency Web Audio player, and an optional Tauri 2 shell. It keeps credentials, listening history, and media cache on the user’s machine.
 
+- **Repository:** <https://github.com/snoah986/MyRiddim>
+- **Releases:** <https://github.com/snoah986/MyRiddim/releases>
+- **Issues:** <https://github.com/snoah986/MyRiddim/issues>
+
 > **Status:** active development. `v1.2.0` is the latest committed release; the current checkout also contains a large, uncommitted feature pass. Treat unreleased features as experimental until they are split, tested, and committed.
 
 ## Highlights
@@ -42,7 +46,7 @@ The backend is the authority for provider access, credentials, SQLite schemas, s
 
 ### Local web development
 
-- Node.js 18 or newer
+- Node.js 20.19 or newer (or 22.12+) — required by Vite 8 and the Svelte plugin
 - Python 3.10 or newer
 - A valid YouTube Music `browser.json` or OAuth setup
 - Network access to YouTube Music and optional lyric providers
@@ -51,9 +55,15 @@ The backend is the authority for provider access, credentials, SQLite schemas, s
 
 - Rust stable via [rustup](https://rustup.rs/)
 - Windows: Visual Studio Desktop development with C++ / MSVC Build Tools
-- macOS: Xcode command-line tools
+- macOS: Xcode command-line tools (`xcode-select --install`)
 - Linux: Tauri WebKitGTK dependencies; the CI workflow installs Ubuntu dependencies
 - PyInstaller for a bundled Python sidecar
+
+### macOS notes
+
+- The quick-start path (two terminals, below) works on Apple Silicon and Intel Macs with a Homebrew or system Python 3.10+ and Node.js 20.19+ (or 22.12+).
+- The desktop app bundles its own Python runtime via the sidecar, so a system Python is only needed for the source checkout flow.
+- First launch of an unsigned `.app` or `.dmg` from GitHub releases: right-click the app and choose **Open**, or run `xattr -dr com.apple.quarantine /Applications/ytm-player.app` once. Apple Silicon also requires the app to be signed or notarized for the standard double-click path; the CI workflow builds but does not currently codesign or notarize.
 
 ## Quick start
 
@@ -68,7 +78,7 @@ python backend/app.py
 npm run dev
 ```
 
-Open <http://localhost:5173>. On first launch, paste the contents of `browser.json` or use the OAuth flow. Credentials and statistics are stored outside the repository. Do not commit session data.
+Open <http://localhost:5193>. On first launch, paste the contents of `browser.json` or use the OAuth flow. Credentials and statistics are stored outside the repository. Do not commit session data.
 
 ## Tauri packaging
 
@@ -86,7 +96,9 @@ npm run tauri dev
 npm run tauri build
 ```
 
-`src-tauri/tauri.conf.json` disables native decorations, points Tauri at the Vite frontend, declares `binaries/ytm-backend` as an external binary, and includes the backend resource. `src-tauri/src/lib.rs` first attempts the sidecar and then falls back to `python backend/app.py` in a source checkout. The Windows installer workflow is under `.github/workflows/`; inspect the audit before relying on it for a release because multiple workflow drafts currently use different sidecar names and targets.
+`scripts/build_sidecar.py` names the sidecar for the machine it runs on (`ytm-backend-aarch64-apple-darwin` on Apple Silicon, `ytm-backend-x86_64-apple-darwin` on Intel Macs, `ytm-backend-x86_64-pc-windows-msvc.exe` on Windows). `src-tauri/tauri.conf.json` disables native decorations, points Tauri at the Vite frontend, declares `binaries/ytm-backend` as an external binary, and includes the backend resource. `src-tauri/src/lib.rs` first attempts the sidecar and then falls back to `python backend/app.py` in a source checkout.
+
+`.github/workflows/tauri.yml` builds the desktop app on Windows, macOS (`macos-latest`, arm64), and Linux on tag pushes, and the `build.yml` workflow produces the Windows NSIS installer. Inspect the audit before relying on these for a release: they build unsigned bundles, and the updater endpoint in `src-tauri/tauri.conf.json` points at the GitHub releases feed for `snoah986/MyRiddim`.
 
 ## Configuration
 

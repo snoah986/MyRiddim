@@ -42,7 +42,9 @@ jobs:
         shell: bash
         run: |
           python -m pip install --quiet pyinstaller -r backend/requirements.txt
-          pyinstaller --onefile --name ytm-backend backend/app.py --distpath src-tauri/binaries --workpath build/pyi --specpath build/pyi
+          ADD_DATA="backend/static:static"
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then ADD_DATA="backend/static;static"; fi
+          pyinstaller --onefile --name ytm-backend backend/app.py --distpath src-tauri/binaries --workpath build/pyi --specpath build/pyi --add-data "$ADD_DATA"
 
       # Tauri sidecars must carry the target-triple suffix in their file name.
       - name: Rename sidecar for the target triple

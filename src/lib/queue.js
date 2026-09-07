@@ -52,6 +52,21 @@ export function playUpcoming(track) {
   queue.update(value => ({ ...value, history: value.nowPlaying ? [...value.history, historyEntry(value.nowPlaying)] : value.history, nowPlaying: track, upNext: value.upNext.filter(item => item.videoId !== track.videoId) }))
 }
 
+// Select an existing upcoming item by its exact queue position. The remaining
+// items retain their original order; nothing is inserted or duplicated.
+export function selectUpcoming(index) {
+  queue.update(value => {
+    if (!Number.isInteger(index) || index < 0 || index >= value.upNext.length) return value
+    const nowPlaying = value.upNext[index]
+    return {
+      ...value,
+      history: value.nowPlaying ? [...value.history, historyEntry(value.nowPlaying)] : value.history,
+      nowPlaying,
+      upNext: value.upNext.slice(index + 1),
+    }
+  })
+}
+
 export function playNext(track, queueSource = 'manual') {
   const queued = { ...track, queueSource }
   queue.update(value => ({ ...value, upNext: [queued, ...value.upNext.filter(item => item.videoId !== queued.videoId)] }))

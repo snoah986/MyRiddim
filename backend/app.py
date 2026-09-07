@@ -510,6 +510,11 @@ def valid_browse_id(value):
     return bool(value) and bool(BROWSE_ID_RE.match(str(value)))
 
 
+def valid_album_id(value):
+    """ytmusicapi album IDs must use the MPRE prefix."""
+    return bool(value) and str(value).startswith("MPRE") and bool(BROWSE_ID_RE.match(str(value)))
+
+
 _rate_buckets = defaultdict(list)
 _rate_lock = threading.Lock()
 
@@ -1153,6 +1158,38 @@ def search_item(item, forced_kind=None):
         value["duration"] = normalized["duration"]
     return value
 
+def search_preference_scores():
+    """Return lightweight listening-frequency scores for search ranking."""
+    try:
+        with db_connection() as db:
+            def grouped(column):
+                rows = db.execute(f"SELECT lower(trim({column})) AS value, COUNT(*) AS plays FROM listens WHERE trim({column}) != '' GROUP BY lower(trim({column}))").fetchall()
+                return {row["value"]: int(row["plays"] or 0) for row in rows}
+            return {
+                "video": grouped("video_id"),
+                "title": grouped("title"),
+                "artist": grouped("artist"),
+                "album": grouped("album"),
+            }
+    except sqlite3.Error:
+        return {"video": {}, "title": {}, "artist": {}, "album": {}}
+
+
+def search_preference_score(item, scores):
+    title = clean(item.get("title")).lower()
+    artist = clean(item.get("artist")).lower()
+    album = clean(item.get("album")).lower()
+    video_id = clean(item.get("videoId") or item.get("id")).lower()
+    if item.get("type") == "artist":
+        return scores["artist"].get(title, 0) * 4
+    if item.get("type") == "album":
+        return scores["album"].get(title, 0) * 3
+    return (scores["video"].get(video_id, 0) * 6
+            + scores["artist"].get(artist, 0) * 2
+            + scores["album"].get(album, 0)
+            + scores["title"].get(title, 0))
+
+
 @app.get("/api/search")
 @rate_limit("search", 8, 10)
 def search():
@@ -1195,6 +1232,11 @@ def search():
         # the shelf never renders a card that cannot open its artist page.
         items = [item for item in items if item and not (item["type"] == "artist" and not item["id"])
                 and not (item["type"] == "song" and normalize_track(item) is None)]
+        scores = search_preference_scores()
+        items = [item for _, item in sorted(
+            enumerate(items),
+            key=lambda pair: (-search_preference_score(pair[1], scores), pair[0]),
+        )]
         return jsonify({"query": query, "results": items,
                         "songs": [item for item in items if item["type"] == "song"],
                         "artists": [item for item in items if item["type"] == "artist"],
@@ -1263,7 +1305,20 @@ def remove_track():
     if not valid_playlist_id(playlist_id) or not valid_video_id(video_id):
         return jsonify({"error": "Invalid playlist id or video id", "ok": False}), 400
     try:
-        require_yt().remove_playlist_items(playlist_id, [video_id])
+        client = require_yt()
+        # ytmusicapi's remove_playlist_items only accepts items carrying both
+        # videoId and setVideoId; a bare video id is silently filtered out and
+        # the call raises. Resolve setVideoId from the playlist's own track
+        # list so the frontend contract (playlist_id + video_id) stays intact.
+        data = client.get_playlist(playlist_id, limit=None) or {}
+        set_video_id = None
+        for item in (data.get("tracks") or []):
+            if isinstance(item, dict) and clean(item.get("videoId")) == video_id:
+                set_video_id = clean(item.get("setVideoId"))
+                break
+        if not set_video_id:
+            return jsonify({"error": "Track not found in playlist", "ok": False}), 404
+        client.remove_playlist_items(playlist_id, [{"videoId": video_id, "setVideoId": set_video_id}])
         return jsonify({"ok": True})
     except Exception as exc:
         return api_error(exc, 400)
@@ -2983,7 +3038,7 @@ GENRE_ARTIST_SEEDS = {
 }
 
 
-def _search_provider_songs(client, query, limit=12):
+def _search_provider_songs(client, query, limit=50):
     try:
         return client.search(query, filter="songs", limit=limit) or []
     except TypeError:
@@ -3012,7 +3067,7 @@ def home_recommendations():
                     tracks.append(track)
                 if len(tracks) >= 24:
                     break
-            if len(tracks) >= 24:
+            if len(tracks) >= 50:
                 break
         return jsonify({"genre": genre, "seeds": seeds, "tracks": tracks})
     except Exception as exc:
@@ -3033,7 +3088,7 @@ def home_shelves():
             MAX(album) album, MAX(thumbnail_url) thumbnail, COUNT(*) plays,
             MAX(played_at_timestamp) played_at
             FROM listens WHERE video_id != '' GROUP BY video_id
-            ORDER BY played_at DESC LIMIT 24 OFFSET ?""", (offset,)).fetchall()
+            ORDER BY played_at DESC LIMIT 50 OFFSET ?""", (offset,)).fetchall()
     local_tracks = []
     for row in rows:
         track = stat_track(row)
@@ -3044,8 +3099,8 @@ def home_shelves():
     client = get_yt()
     shelves = []
     if local_tracks:
-        shelves.append({"id": f"heavy-{page}", "title": "Heavy Rotation", "items": local_tracks[:12]})
-        shelves.append({"id": f"fresh-{page}", "title": "Underground & Fresh Drops", "items": local_tracks[12:24]})
+        shelves.append({"id": f"heavy-{page}", "title": "Heavy Rotation", "items": local_tracks[:25]})
+        shelves.append({"id": f"fresh-{page}", "title": "Underground & Fresh Drops", "items": local_tracks[25:50]})
     if client is not None:
         names = []
         with db_connection() as db:
@@ -3336,7 +3391,7 @@ def discovery_shelf():
             # 2. One-hop related-artist traversal: same sonic space as the
             # user's top artists, but artists with little local play history.
             for artist_name in _discovery_top_artists(db, 3)[:3]:
-                if len(discovery) >= 12:
+                if len(discovery) >= 50:
                     break
                 try:
                     matches = client.search(artist_name, filter="artists", limit=1) or []
@@ -3357,9 +3412,9 @@ def discovery_shelf():
                             track["related_to"] = artist_name
                             seen.add(track["videoId"])
                             discovery.append(track)
-                            if len(discovery) >= 12:
+                            if len(discovery) >= 50:
                                 break
-                        if len(discovery) >= 12:
+                        if len(discovery) >= 50:
                             break
                 except Exception as exc:
                     print(f"Related-artist traversal failed for {artist_name}: {exc}", flush=True)
@@ -3386,14 +3441,14 @@ def discovery_shelf():
         return jsonify({"error": str(exc), "recommendations": []}), 502
     # Interleave 2 discoveries per familiar deep cut (the 60/40 split).
     combined, di, fi = [], 0, 0
-    while len(combined) < 20 and (di < len(discovery) or fi < len(familiar)):
+    while len(combined) < 50 and (di < len(discovery) or fi < len(familiar)):
         if di < len(discovery):
             combined.append(discovery[di]); di += 1
-        if di < len(discovery) and len(combined) < 20:
+        if di < len(discovery) and len(combined) < 50:
             combined.append(discovery[di]); di += 1
         if fi < len(familiar):
             combined.append(familiar[fi]); fi += 1
-    combined = combined[:20]
+    combined = combined[:50]
     DISCOVERY_CACHE[cache_key] = (time.time(), combined)
     return jsonify({"recommendations": combined})
 
@@ -3551,7 +3606,24 @@ def _album_payload(client, browse_id):
         artists = [artists]
     artist_name = ", ".join(clean(a.get("name")) for a in artists if isinstance(a, dict) and a.get("name"))
     artist_id = next((clean(a.get("id")) for a in artists if isinstance(a, dict) and a.get("id")), None)
-    tracks = [track for item in (data.get("tracks") or []) if (track := track_data(item))]
+    album_thumbnails = data.get("thumbnails") or data.get("thumbnail")
+    album_artist_field = data.get("artists") or data.get("artist")
+    raw_tracks = data.get("tracks") or []
+    tracks = []
+    for item in raw_tracks:
+        if not isinstance(item, dict):
+            continue
+        # Album track rows from ytmusicapi often omit artwork and artist data;
+        # inherit the album-level metadata before normalizing so valid rows are
+        # not discarded by the strict playable-track boundary.
+        enriched = dict(item)
+        if not enriched.get("thumbnails") and not enriched.get("thumbnail"):
+            enriched["thumbnails"] = album_thumbnails
+        if not enriched.get("artists") and not enriched.get("artist") and album_artist_field:
+            enriched["artists"] = album_artist_field
+        track = track_data(enriched)
+        if track:
+            tracks.append(track)
     return {
         "browseId": browse_id,
         "title": clean(data.get("title")),
@@ -3607,7 +3679,7 @@ def album_resolve():
     client = get_yt()
     if client is None:
         return api_error(RuntimeError("ytmusicapi is not available"))
-    browse_id = title if valid_browse_id(title) else None
+    browse_id = title if valid_album_id(title) else None
     if not browse_id:
         query = f"{artist} {title}".strip() if artist else title
         try:
@@ -3760,8 +3832,8 @@ def artist_page(browse_id):
 @rate_limit("browse", 12, 10)
 def album_page(browse_id):
     browse_id = clean(browse_id)
-    if not valid_browse_id(browse_id):
-        return jsonify({"error": "Invalid browse id"}), 400
+    if not valid_album_id(browse_id):
+        return jsonify({"error": "Invalid album browse id"}), 400
     client = get_yt()
     if client is None:
         return api_error(RuntimeError("ytmusicapi is not available"))
@@ -4564,6 +4636,15 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 @app.route("/party")
 def serve_mobile():
     return send_from_directory(STATIC_DIR, "mobile.html")
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    if path and (STATIC_DIR / path).exists():
+        return send_from_directory(STATIC_DIR, path)
+    return send_from_directory(STATIC_DIR, "index.html")
+
 
 if __name__ == "__main__":
     # Bind to all interfaces so the mobile remote and Party Mode guests can

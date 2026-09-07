@@ -250,6 +250,26 @@ export function getActiveAudio() {
   return els[live].el
 }
 
+export async function getAudioOutputs() {
+  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.enumerateDevices) return []
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices()
+    return devices.filter(device => device.kind === 'audiooutput')
+  } catch {
+    return []
+  }
+}
+
+async function setOutputDevice(deviceId) {
+  ensure()
+  for (const key of ['A', 'B']) {
+    const element = els[key].el
+    if (element && typeof element.setSinkId === 'function') {
+      await element.setSinkId(deviceId)
+    }
+  }
+}
+
 export const audio = {
   get src() { return els[live].el ? els[live].el.src : '' },
   set src(value) {
@@ -292,6 +312,7 @@ export const audio = {
     if (els[live].el) els[live].el.pause()
   },
   clear,
+  setOutputDevice,
   adoptGapless,
   get gapFilled() { return gapFilled },
   preload,

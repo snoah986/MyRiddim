@@ -1,5 +1,6 @@
 <script>
   import TrackContextMenu from './TrackContextMenu.svelte'
+  import AudioOutputPicker from './AudioOutputPicker.svelte'
 
   export let track = null
   export let isPlaying = false
@@ -56,10 +57,12 @@
 
     <div class="transport-actions">
       <label class="volume" aria-label="Volume"><svg viewBox="0 0 24 24"><path d="M4 10v4h4l5 4V6l-5 4H4zm12.5-2a6 6 0 0 1 0 8M19 5a10 10 0 0 1 0 14"></path></svg><input type="range" min="0" max="1" step=".01" value={volume} on:change={onVolume} /></label>
+      <AudioOutputPicker compact />
       <button class="icon-button" on:click={onQueue} aria-label="Open playback queue" title="Queue"><svg viewBox="0 0 24 24"><path d="M4 6h12M4 12h16M4 18h9"></path></svg></button>
       <button class="icon-button" on:click={onTheatre} aria-label="Open Theatre Mode" title="Theatre Mode"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"></rect><path d="m9 9 5 3-5 3z"></path></svg></button>
       <button class="more-button" on:click={() => moreOpen = !moreOpen} aria-label="More player actions" aria-expanded={moreOpen} title="More actions">···</button>
       {#if moreOpen}<div class="more-menu" role="menu">
+        <button role="menuitem" on:click={() => { moreOpen = false; onTheatre() }}>Theatre Mode</button>
         <button role="menuitem" on:click={() => { moreOpen = false; onPartyOpen() }}>Party Mode</button>
         <button role="menuitem" on:click={() => { moreOpen = false; onAddToPlaylist(track) }}>Add to Playlist</button>
         <button role="menuitem" on:click={() => { sleepChoice = sleepChoice === 30 ? 60 : sleepChoice === 60 ? 0 : 30; onSleepTimer(sleepChoice); moreOpen = false }}>{sleepChoice ? `Sleep Timer · ${sleepChoice}m` : 'Sleep Timer'}</button>
