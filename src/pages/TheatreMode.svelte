@@ -277,6 +277,8 @@
   let videoOffsetRequest = 0
   let videoEntryAudioTime = 0
   let videoHandoffPending = false
+  let videoEngaged = false
+  let videoDeckPaused = false
   let syncToast = ''
   let syncToastTimer
   const ANTICIPATION_LEAD = 0.18
@@ -309,11 +311,12 @@
     loadLyrics(track.videoId)
     loadKaraokeLyrics(track.videoId)
   }
-  $: if (lyricsOpen && (isPlaying || (isVideoMode && videoPlaying))) startLyricSyncLoop(); else stopLyricSyncLoop()
+  $: if (lyricsOpen && (isPlaying || isVideoMode || videoPlaying)) startLyricSyncLoop(); else stopLyricSyncLoop()
   $: if (track?.videoId || track?.id) loadTrackOffset(track?.videoId || track?.id)
   $: if (isVideoMode && videoModeTrackId && companionVideoId !== videoModeTrackId) exitVideoMode(true)
   $: if (isVideoMode && videoModeTrackId) loadVideoOffset(videoModeTrackId)
   $: if (isPlaying || videoPlaying) armCinemaTimer(); else wakeChrome(false)
+  $: if (isVideoMode && videoEngaged) { const __el = liveVideo(); if (__el) __el.volume = Math.max(0, Math.min(1, Number(volume) || 0)) }
 
   const clean = value => String(value ?? '').replace(/[\\\n\r\t]+/g, ' ').replace(/\s+/g, ' ').trim()
   const formatTime = seconds => !Number.isFinite(Number(seconds)) ? '0:00' : `${Math.floor(Number(seconds) / 60)}:${String(Math.floor(Number(seconds) % 60)).padStart(2, '0')}`
@@ -570,18 +573,9 @@
     if (!id) return false
     videoLoading = true
     try {
-      // Prefer the short, muted Theatre loop. The backend starts generating it
-      // on the first request and returns the progressive stream as a fallback.
-      try {
-        const loopResponse = await apiFetch(`/api/media/backdrop?trackId=${encodeURIComponent(id)}`)
-        const loopData = await loopResponse.json().catch(() => ({}))
-        if (request !== videoRequest) return false
-        if (loopResponse.ok && loopData.loopUrl) {
-          videoUrl = loopData.loopUrl
-          return true
-        }
-      } catch { /* use the progressive companion stream below */ }
-
+      // Resolve the full official companion video so video mode plays the whole
+      // track; the short muted backdrop loop keeps running behind it on its own
+      // element while this stream buffers.
       const response = await apiFetch(`/api/video-url/${encodeURIComponent(id)}`)
       const data = await response.json()
       const resolvedUrl = data.stream_url || data.url
@@ -599,18 +593,51 @@
     }
   }
 
-  function videoMetadataLoaded() {
-    if (!videoElement || !isVideoMode) return
-    videoDuration = Number.isFinite(videoElement.duration) ? videoElement.duration : 0
+  // The video element lives in two exclusive layouts (art-frame native-video
+  // and the lyrics backdrop-video) that both bind videoElement. Whichever
+  // element Svelte tears down can leave that binding pointing at a detached
+  // element, so every handler resolves the element that is actually connected
+  // (its own event target first, then the DOM).
+  function liveVideo(event) {
+    const fromEvent = event?.currentTarget
+    if (fromEvent?.isConnected) return fromEvent
+    if (videoElement?.isConnected) return videoElement
+    return isVideoMode ? document.querySelector('video.native-video, video.backdrop-video') : null
+  }
+
+  function videoMetadataLoaded(event) {
+    const el = liveVideo(event)
+    if (!el || !isVideoMode) return
+    videoDuration = Number.isFinite(el.duration) ? el.duration : 0
     // Hand-off: the companion video must land where the same studio content
     // plays (AudioTime + introOffset), never at the raw audio position.
     const target = Math.max(0, videoEntryAudioTime + (videoOffset || 0))
-    videoElement.currentTime = Math.min(target, videoDuration || target)
+    el.currentTime = Math.min(target, videoDuration || target)
     if ((videoOffset || 0) > 0) videoHandoffPending = false
-    videoElement.play().then(() => { videoPlaying = true }).catch(videoPlaybackError)
+    el.play().then(() => { videoPlaying = true }).catch(videoPlaybackError)
   }
 
-  function videoPlayed() { videoPlaying = true; wakeChrome() }
+  function videoPlayed(event) {
+    videoPlaying = true
+    wakeChrome()
+    engageVideoAudio(event)
+  }
+
+  // The companion video must start muted (browsers block unmuted autoplay
+  // outside a user gesture). Once it is actually playing, unmute it and pause
+  // the audio deck in the same tick so the same song is not heard twice and
+  // the handover never drops into silence.
+  function engageVideoAudio(event) {
+    const el = liveVideo(event)
+    if (!isVideoMode || !el || el.paused || !el.muted) return
+    el.muted = false
+    el.volume = Math.max(0, Math.min(1, Number(volume) || 0))
+    videoEngaged = true
+    if (videoPausedAudio && !videoDeckPaused) {
+      videoDeckPaused = true
+      onToggle()
+    }
+  }
   function videoPaused() { videoPlaying = false }
 
   function videoPlaybackError(event) {
@@ -624,15 +651,17 @@
     onVolume({ currentTarget: { value: String(next) } })
   }
 
-  function videoTimeUpdated() {
-    if (videoElement && isVideoMode) currentPlaybackTime = videoElement.currentTime
+  function videoTimeUpdated(event) {
+    const el = liveVideo(event)
+    if (el && isVideoMode) currentPlaybackTime = el.currentTime
   }
 
   function togglePlayback() {
     wakeChrome()
-    if (isVideoMode && videoElement) {
-      if (videoElement.paused) videoElement.play().catch(videoPlaybackError)
-      else videoElement.pause()
+    const el = liveVideo()
+    if (isVideoMode && el) {
+      if (el.paused) el.play().catch(videoPlaybackError)
+      else el.pause()
     } else onToggle()
   }
 
@@ -640,9 +669,10 @@
     const value = Number(event.currentTarget.value)
     if (!Number.isFinite(value)) return
     videoHandoffPending = false
-    if (isVideoMode && videoElement) {
+    const el = liveVideo()
+    if (isVideoMode && el) {
       currentPlaybackTime = value
-      videoElement.currentTime = value
+      el.currentTime = value
     } else onSeek(event)
     syncLyricsOnce()
   }
@@ -661,19 +691,27 @@
     videoModeTrackId = companionVideoId
     videoPausedAudio = isPlaying
     isVideoMode = true
-    if (videoPausedAudio) onToggle()
-    await loadVideo(companionVideoId)
+    // Keep the deck running until the companion video is actually audible; the
+    // handover (unmute the video, pause the deck) happens once it is playing.
+    videoEngaged = false
+    videoDeckPaused = false
+    const loaded = await loadVideo(companionVideoId)
+    if (!loaded) exitVideoMode(false)
   }
 
   async function exitVideoMode(resumeAudio = true) {
     if (!isVideoMode) return
-    currentPlaybackTime = videoElement?.currentTime ?? currentPlaybackTime
+    const exitEl = liveVideo()
+    currentPlaybackTime = exitEl?.currentTime ?? currentPlaybackTime
     // Hand-off back: the audio deck resumes at AudioTime = VideoTime - introOffset.
     const audioTarget = Math.max(0, currentPlaybackTime - (videoOffset || 0))
-    videoElement?.pause()
+    exitEl?.pause()
     videoPlaying = false
-    const shouldResume = resumeAudio && videoPausedAudio
+    const engaged = videoEngaged
+    const deckWasPlaying = videoPausedAudio
     isVideoMode = false
+    videoEngaged = false
+    videoDeckPaused = false
     videoModeTrackId = null
     videoUrl = null
     videoDuration = 0
@@ -685,8 +723,10 @@
     videoHandoffPending = false
     refreshLyricDisplays()
     videoPausedAudio = false
-    onSeek({ currentTarget: { value: audioTarget } })
-    if (shouldResume) {
+    // Only touch the deck if the video actually took over playback: park it at
+    // the matching audio position, and resume it if this session paused it.
+    if (engaged) onSeek({ currentTarget: { value: audioTarget } })
+    if (engaged && deckWasPlaying && resumeAudio) {
       await tick()
       onToggle()
     }
@@ -789,7 +829,8 @@
   }
 
   function mediaTime() {
-    return isVideoMode ? (videoElement?.currentTime ?? currentPlaybackTime) : (getActiveAudio()?.currentTime ?? audio.currentTime)
+    const el = liveVideo()
+    return isVideoMode ? (el?.currentTime ?? currentPlaybackTime) : (getActiveAudio()?.currentTime ?? audio.currentTime)
   }
 
   // Lyric timestamps (LRC and YRC) are permanently referenced to the studio
@@ -799,7 +840,8 @@
   // the audio-referenced position at any instant so lyric rendering never
   // consumes raw video time directly.
   function lyricClock() {
-    const now = isVideoMode ? (videoElement?.currentTime ?? currentPlaybackTime) : (getActiveAudio()?.currentTime ?? audio.currentTime)
+    const el = liveVideo()
+    const now = isVideoMode ? (el?.currentTime ?? currentPlaybackTime) : (getActiveAudio()?.currentTime ?? audio.currentTime)
     return isVideoMode ? Math.max(0, now - (videoOffset || 0)) : now
   }
 
@@ -891,8 +933,9 @@
       refreshLyricDisplays()
       // Late-arriving intro offset: align the already-mounted video to the
       // studio position so content (not raw time) stays in sync.
-      if (videoHandoffPending && videoElement && isVideoMode) {
-        if (videoOffset > 0) videoElement.currentTime = Math.max(0, videoEntryAudioTime + videoOffset)
+      const lateEl = liveVideo()
+      if (videoHandoffPending && lateEl && isVideoMode) {
+        if (videoOffset > 0) lateEl.currentTime = Math.max(0, videoEntryAudioTime + videoOffset)
         videoHandoffPending = false
       }
       syncLyricsOnce()
@@ -943,11 +986,12 @@
 
   function seekLine(time) {
     if (!Number.isFinite(time)) return
-    if (isVideoMode && videoElement) {
+    const seekEl = liveVideo()
+    if (isVideoMode && seekEl) {
       // Lyric lines are studio-referenced; seek the video to AudioTime + introOffset.
       const videoTarget = Math.max(0, time + (videoOffset || 0))
       currentPlaybackTime = videoTarget
-      videoElement.currentTime = videoTarget
+      seekEl.currentTime = videoTarget
       videoHandoffPending = false
     } else onSeek({ currentTarget: { value: time } })
     syncLyricsOnce()

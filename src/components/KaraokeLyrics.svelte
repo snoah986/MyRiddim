@@ -80,7 +80,11 @@
       node.classList.toggle('current', now >= start && now < end)
     })
     syncState.lastLine = active
-    if (playing || media && !media.paused) raf = requestAnimationFrame(sync)
+    // Keep ticking while any lines are mounted: the sync loop must survive
+    // layout swaps that replace the bound media element (e.g. Theatre Mode's
+    // native-video to lyrics backdrop-video), which would otherwise leave a
+    // stale element and freeze the active-word highlight.
+    if (lines.length) raf = requestAnimationFrame(sync)
   }
 
   $: if (lines || playing || media) {
