@@ -223,7 +223,7 @@
         </div>
         <div class="row sub" class:disabled={!$settings.crossfade}>
           <div class="row-label"><strong>Crossfade duration</strong><small>{$settings.crossfadeDuration || 0}s overlap</small></div>
-          <input class="slider" type="range" min="0" max="12" step="0.5" value={$settings.crossfadeDuration} disabled={!$settings.crossfade} on:input={event => updateSetting('crossfadeDuration', Number(event.currentTarget.value))} aria-label="Crossfade duration in seconds" />
+          <input class="slider" type="range" min="0" max="30" step="0.5" value={$settings.crossfadeDuration} disabled={!$settings.crossfade} on:input={event => updateSetting('crossfadeDuration', Number(event.currentTarget.value))} aria-label="Crossfade duration in seconds" />
         </div>
         <div class="row">
           <div class="row-label"><strong>Instant queue flush</strong><small>Use one click instead of holding the trash control for 0.8 seconds.</small></div>

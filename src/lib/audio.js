@@ -3,7 +3,11 @@
 // Theatre Mode visualizer. Exposed as a drop-in proxy that mirrors the old
 // single-<audio> API used by App.svelte.
 const FADE = 3.5        // default crossfade duration (seconds)
-const PRELOAD_WINDOW = 15 // start buffering the next track this close to the end
+const CURVE_STEPS = 96   // equal-power curve resolution for the crossfade ramps
+// Buffer the next track early enough that it is fully streamable before the
+// fade must begin: fetch lead + a solid download margin (not the fixed 15s,
+// which left <3s of margin for long fades and silently dropped them).
+const leadSeconds = () => Math.max(15, fadeSeconds + 18)
 
 let ctx = null
 let master = null
@@ -68,7 +72,14 @@ function ensure() {
     el.addEventListener('pause', () => { if (isLive(el)) emit('pause') })
     el.addEventListener('timeupdate', onTimeUpdate)
     el.addEventListener('loadedmetadata', () => { if (isLive(el)) emit('loadedmetadata') })
-    el.addEventListener('ended', () => { if (isLive(el)) emit('ended') })
+    el.addEventListener('ended', () => {
+      if (!isLive(el)) return
+      // The outgoing deck hit its natural end while a crossfade is running
+      // (e.g. the incoming became ready later than scheduled). Promote the
+      // incoming deck now instead of letting the app restart it from zero.
+      if (fading && pendingTrackId) { finalizeFade(); return }
+      emit('ended')
+    })
     el.addEventListener('error', () => { if (isLive(el)) emit('error') })
   }
 }
@@ -120,33 +131,49 @@ function startFade() {
   if (fading || !preloaded || !pendingSrc || !incomingEl.src || incomingEl.readyState < 2) return
   fading = true
   const now = ctx.currentTime
+  // Equal-power (cos²/sin²) ramps keep the summed loudness constant across
+  // the blend. Linear ramps dip ~2-3dB mid-fade, which reads as a volume pump
+  // instead of a seamless transition.
+  const fadeOut = new Float32Array(CURVE_STEPS)
+  const fadeIn = new Float32Array(CURVE_STEPS)
+  for (let i = 0; i < CURVE_STEPS; i += 1) {
+    const theta = (i / (CURVE_STEPS - 1)) * (Math.PI / 2)
+    fadeOut[i] = volume * Math.cos(theta) ** 2
+    fadeIn[i] = volume * Math.sin(theta) ** 2
+  }
   els[outgoing].gain.gain.cancelScheduledValues(now)
   els[outgoing].gain.gain.setValueAtTime(els[outgoing].gain.gain.value, now)
-  els[outgoing].gain.gain.linearRampToValueAtTime(0, now + fadeSeconds)
+  els[outgoing].gain.gain.setValueCurveAtTime(fadeOut, now, fadeSeconds)
   els[incoming].gain.gain.cancelScheduledValues(now)
   els[incoming].gain.gain.setValueAtTime(0, now)
-  els[incoming].gain.gain.linearRampToValueAtTime(volume, now + fadeSeconds)
+  els[incoming].gain.gain.setValueCurveAtTime(fadeIn, now, fadeSeconds)
   incomingEl.play().catch(() => abortFade())
-  fadeTimer = setTimeout(() => {
-    if (!fading) return
-    fading = false
-    gapFilled = !!pendingTrackId
-    gapFilledTrackId = pendingTrackId
-    live = incoming
-    els[outgoing].el.pause()
-    els[outgoing].el.removeAttribute('src')
-    els[outgoing].el.load()
-    els[outgoing].gain.gain.cancelScheduledValues(ctx.currentTime)
-    els[outgoing].gain.gain.setValueAtTime(0, ctx.currentTime)
-    els[incoming].gain.gain.cancelScheduledValues(ctx.currentTime)
-    els[incoming].gain.gain.setValueAtTime(volume, ctx.currentTime)
-    pendingSrc = null
-    pendingTrackId = null
-    preloaded = false
-    // The outgoing element never reaches its natural end, so synthesize it:
-    // the app advances the queue and adopts the already-playing incoming URL.
-    emit('ended')
-  }, fadeSeconds * 1000)
+  fadeTimer = setTimeout(finalizeFade, fadeSeconds * 1000)
+}
+
+// Complete the handoff: promote the incoming deck to live and synthesize the
+// outgoing element's 'ended' so the app advances the queue and adopts the
+// already-playing track without touching its transport position.
+function finalizeFade() {
+  if (!fading) return
+  fading = false
+  if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null }
+  const outgoing = live
+  const incoming = otherOf(outgoing)
+  gapFilled = !!pendingTrackId
+  gapFilledTrackId = pendingTrackId
+  live = incoming
+  els[outgoing].el.pause()
+  els[outgoing].el.removeAttribute('src')
+  els[outgoing].el.load()
+  els[outgoing].gain.gain.cancelScheduledValues(ctx.currentTime)
+  els[outgoing].gain.gain.setValueAtTime(0, ctx.currentTime)
+  els[incoming].gain.gain.cancelScheduledValues(ctx.currentTime)
+  els[incoming].gain.gain.setValueAtTime(volume, ctx.currentTime)
+  pendingSrc = null
+  pendingTrackId = null
+  preloaded = false
+  emit('ended')
 }
 
 // Commit the already-audible incoming deck as the current track without
@@ -199,7 +226,7 @@ function setFade(seconds) {
 
 function onTimeUpdate() {
   const el = els[live].el
-  if (fadeSeconds > 0 && pendingSrc && !preloaded && el.duration && el.duration - el.currentTime <= PRELOAD_WINDOW) {
+  if (fadeSeconds > 0 && pendingSrc && !preloaded && el.duration && el.duration - el.currentTime <= leadSeconds()) {
     const incoming = otherOf(live)
     els[incoming].el.src = pendingSrc
     preloaded = true
@@ -217,7 +244,7 @@ function preload(url, trackId = null) {
   pendingTrackId = trackId || null
   preloaded = false
   const el = els[live].el
-  if (el.duration && el.duration - el.currentTime <= PRELOAD_WINDOW) {
+  if (el.duration && el.duration - el.currentTime <= leadSeconds()) {
     const incoming = otherOf(live)
     els[incoming].el.src = url
     preloaded = true
