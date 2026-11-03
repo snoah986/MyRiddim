@@ -12,7 +12,7 @@
   export let onOpenSmartCreator = () => {}
   export let onOpenSettings = () => {}
 
-  const navItems = [['home', 'Home'], ['recent', 'Recently played'], ['favorites', 'Favorites'], ['discover', 'Discover'], ['stats', 'Stats'], ['updates', 'Updates']]
+  const navItems = [['home', 'Home'], ['recent', 'Recently played'], ['favorites', 'Favorites'], ['discover', 'Discover'], ['playlists', 'Playlists'], ['stats', 'Stats'], ['updates', 'Updates']]
 </script>
 
 <div class="shell topbar-shell">

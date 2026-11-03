@@ -8,7 +8,7 @@
   export let onViewChange = () => {}
   export let onOpenSettings = () => {}
   import SearchSuggestions from '../components/SearchSuggestions.svelte'
-  const navItems = [['home', 'Home', '⌂'], ['discover', 'Discover', '✦'], ['favorites', 'Favorites', '♡'], ['stats', 'Stats', '◒'], ['updates', 'Updates', '↗']]
+  const navItems = [['home', 'Home', '⌂'], ['discover', 'Discover', '✦'], ['favorites', 'Favorites', '♡'], ['playlists', 'Playlists', '♫'], ['stats', 'Stats', '◒'], ['updates', 'Updates', '↗']]
 </script>
 
 <div class="shell handheld-shell">

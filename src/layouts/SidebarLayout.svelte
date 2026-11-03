@@ -21,6 +21,7 @@
     ['recent', 'Recently played'],
     ['favorites', 'Favorites'],
     ['discover', 'Discover'],
+    ['playlists', 'Playlists'],
     ['stats', 'Listening stats'],
     ['updates', 'Updates'],
   ]

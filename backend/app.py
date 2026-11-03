@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import logging
 import os
+import difflib
 import tempfile
 import subprocess
 import sqlite3
@@ -3160,11 +3161,28 @@ def discover_artists():
     return jsonify({"artists": artists})
 
 
+def _as_track_list(value):
+    """Coerce a ytmusicapi shelf into the list of song dicts expected here.
+
+    get_artist() returns shelves whose "songs" value can itself be a nested
+    response object rather than a plain list; indexing such a value with
+    [:10] used to crash the whole compile with a confusing TypeError/502.
+    """
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        for key in ("results", "songs", "topSongs", "tracks"):
+            nested = value.get(key)
+            if isinstance(nested, list):
+                return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
 @app.post("/api/mix/compile")
 @app.post("/api/queue/artist-mix")
 @rate_limit("artist_mix", 6, 60)
 def artist_mix_queue():
-    """Build a deduplicated, round-robin queue from two to four artists.
+    """Build a deduplicated, round-robin queue from two to five artists.
 
     Each requested artist contributes up to ten playable tracks. Names use the
     provider search index; browse IDs use the artist catalog when available.
@@ -3188,8 +3206,8 @@ def artist_mix_queue():
         if key and key not in seen_specs:
             seen_specs.add(key)
             specs.append({"name": name, "id": artist_id})
-    if not 2 <= len(specs) <= 4:
-        return jsonify({"error": "Choose between 2 and 4 artists", "tracks": []}), 400
+    if not 2 <= len(specs) <= 5:
+        return jsonify({"error": "Choose between 2 and 5 artists", "tracks": []}), 400
 
     client = get_yt()
     if client is None:
@@ -3197,18 +3215,36 @@ def artist_mix_queue():
     try:
         pools = []
         artists = []
+
+        def _artist_forms_match(expected, provider):
+            """Loose artist-name match for compile filtering.
+
+            Library chips legitimately join multi-artist credits ("M Huncho,
+            D-Block Europe"), which never equals a single provider artist
+            name. Accept exact, either-direction substring, or close-fuzzy
+            matches so those credits keep contributing tracks instead of
+            emptying the pool.
+            """
+            if not expected or not provider:
+                return False
+            if expected == provider or expected in provider or provider in expected:
+                return True
+            return difflib.SequenceMatcher(None, expected, provider).ratio() >= 0.83
         for spec in specs:
             label = spec["name"] or spec["id"]
             matches = []
             if spec["id"]:
                 try:
                     artist_data = client.get_artist(spec["id"]) or {}
-                    matches = artist_data.get("songs") or artist_data.get("topSongs") or []
+                    matches = _as_track_list(artist_data.get("songs") or artist_data.get("topSongs"))
                     label = clean(artist_data.get("name")) or label
                 except Exception as exc:
                     print(f"Artist catalog lookup failed for {spec['id']!r}: {exc}", flush=True)
-            if not matches:
+                    matches = []
+            if not _as_track_list(matches):
                 matches = client.search(f"{label} top tracks", filter="songs", limit=10) or []
+            else:
+                matches = _as_track_list(matches)
 
             expected_artist = re.sub(r"[^a-z0-9]+", "", label.casefold())
             pool, pool_seen = [], set()
@@ -3221,7 +3257,10 @@ def artist_mix_queue():
                     normalized_artist = re.sub(r"[^a-z0-9]+", "", clean(artist_name).casefold())
                     if normalized_artist:
                         provider_artists.append(normalized_artist)
-                if expected_artist and expected_artist not in provider_artists:
+                if expected_artist and not any(
+                    _artist_forms_match(expected_artist, normalized_artist)
+                    for normalized_artist in provider_artists
+                ):
                     continue
                 track = track_data(item)
                 if not track or not valid_video_id(track["videoId"]) or track["videoId"] in pool_seen:
@@ -3232,7 +3271,7 @@ def artist_mix_queue():
             pools.append(pool)
 
         empty_artists = [artists[index] for index, pool in enumerate(pools) if not pool]
-        if empty_artists:
+        if empty_artists and not any(pools):
             return jsonify({
                 "error": "No playable tracks found for: " + ", ".join(empty_artists),
                 "artists": artists,
@@ -3262,7 +3301,12 @@ def artist_mix_queue():
                 if len(tracks) >= 40:
                     break
             index += 1
-        return jsonify({"artists": artists, "tracks": tracks, "source": "artist_round_robin"})
+        return jsonify({
+            "artists": artists,
+            "tracks": tracks,
+            "source": "artist_round_robin",
+            "empty_artists": empty_artists,
+        })
     except Exception as exc:
         traceback.print_exc()
         return jsonify({"error": str(exc), "tracks": []}), 502
@@ -4480,7 +4524,7 @@ def source_stream_url(source, source_id, cached_url=None):
 
 
 @app.get("/api/stream/<track_id>")
-@rate_limit("stream", 8, 20)
+@rate_limit("stream", 20, 20)
 def stream(track_id):
     resolved = resolve_canonical_source(clean(track_id))
     if not resolved:
@@ -4542,7 +4586,7 @@ def stream(track_id):
 
 
 @app.get("/api/proxy-source/<source>/<source_id>")
-@rate_limit("proxy-source", 8, 20)
+@rate_limit("proxy-source", 120, 20)
 def proxy_source_stream(source, source_id):
     """Proxy a non-YouTube provider stream with Range support."""
     if source != "soundcloud" or not source_id or len(source_id) > 80:
@@ -4568,7 +4612,7 @@ def proxy_source_stream(source, source_id):
 
 
 @app.get("/api/proxy/<video_id>")
-@rate_limit("proxy", 8, 20)
+@rate_limit("proxy", 120, 20)
 def proxy_stream(video_id):
     """Same-origin audio proxy with HTTP Range support.
 

@@ -3,6 +3,7 @@
 
   export let tracks = []
   export let favoriteArtists = []
+  export let mixerArtists = []
   export let history = []
   export let persistentHistory = []
   export let stats = { monthly: [], heavyRotation: [] }
@@ -36,12 +37,24 @@
   }
   const trackKey = item => item?.videoId || item?.id || `${item?.title}-${item?.artist}`
 
-  $: sourceArtists = Array.from(new Map([
+  $: mergedSources = [
+    ...(Array.isArray(mixerArtists) ? mixerArtists : []),
     ...(Array.isArray(favoriteArtists) ? favoriteArtists : []),
     ...(Array.isArray(stats?.monthly) ? stats.monthly.flatMap(item => artistEntries(item)) : []),
     ...(Array.isArray(persistentHistory) ? persistentHistory.flatMap(item => artistEntries(item)) : []),
     ...(Array.isArray(history) ? history.flatMap(item => artistEntries(item)) : []),
-  ].map(item => [entityKey(item), item]).filter(([key, item]) => entityName(item) && key !== '')).values())
+  ]
+  // Dedupe by name (not id) so the backend's canonical, id-bearing chips win
+  // over history-derived name-only chips of the same artist.
+  $: sourceArtists = (() => {
+    const byName = new Map()
+    for (const item of mergedSources) {
+      if (!entityName(item)) continue
+      const nameKey = entityName(item).toLowerCase()
+      if (!byName.has(nameKey)) byName.set(nameKey, item)
+    }
+    return [...byName.values()]
+  })()
   $: libraryArtists = sourceArtists.map(item => ({
     name: entityName(item),
     id: entityId(item),
@@ -60,7 +73,7 @@
     const key = entityKey(artist)
     if (selected.some(item => entityKey(item) === key)) {
       selected = selected.filter(item => entityKey(item) !== key)
-    } else if (selected.length < 4) {
+    } else if (selected.length < 5) {
       selected = [...selected, artist]
     }
   }
@@ -136,7 +149,7 @@
     </header>
 
     <div class="mix-slots" aria-label="Selected artists">
-      {#each Array(4) as _, index}
+      {#each Array(5) as _, index}
         {#if selected[index]}
           <button class="mix-slot filled" on:click={() => removeArtist(selected[index])} aria-label="Remove {selected[index].name} from mix">
             {#if selected[index].thumbnail}<img src={selected[index].thumbnail} alt="" referrerpolicy="no-referrer" />{/if}
@@ -164,7 +177,7 @@
     </div>
 
     {#if selected.length >= 2}
-      <div class="selected-summary"><span>{selected.length}/4 selected</span><span>Round-robin queue ready</span></div>
+      <div class="selected-summary"><span>{selected.length}/5 selected</span><span>Round-robin queue ready</span></div>
     {/if}
   </section>
 </section>

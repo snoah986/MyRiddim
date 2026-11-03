@@ -580,8 +580,8 @@
   }
   async function compileArtistMix(artists) {
     const selected = (artists || []).map(item => ({ id: item.id || null, name: clean(item.name || item.title) })).filter(item => item.name)
-    if (selected.length < 2 || selected.length > 4) {
-      showToast('Choose 2–4 artists to compile a mix')
+    if (selected.length < 2 || selected.length > 5) {
+      showToast('Choose 2–5 artists to compile a mix')
       return
     }
     try {
@@ -593,9 +593,10 @@
       const data = await response.json()
       if (!response.ok || data.error) throw Error(data.error || 'Could not compile artist mix')
       const tracks = (data.tracks || []).map(normalizePlayable).filter(Boolean)
-      if (!tracks.length) { showToast('No playable tracks found for those artists'); return }
+      if (!tracks.length) { showToast((data.empty_artists || []).length ? `No playable tracks for: ${(data.empty_artists || []).join(', ')}` : 'No playable tracks found for those artists'); return }
       playQueue(tracks)
-      showToast(`Artist mix started · ${tracks.length} tracks queued`)
+      const skippedArtists = (data.empty_artists || []).join(', ')
+      showToast(`Artist mix started · ${tracks.length} tracks queued${skippedArtists ? ` · skipped ${skippedArtists}` : ''}`)
     } catch (error) {
       showToast(error.message || 'Could not compile artist mix')
     }
