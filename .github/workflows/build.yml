@@ -1,4 +1,4 @@
-﻿name: Cloud Build EXE
+name: Cloud Build EXE
 on:
   push:
     branches: [ main, master ]
@@ -17,7 +17,7 @@ jobs:
           python-version: '3.12'
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: 'npm'
