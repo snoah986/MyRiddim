@@ -16,10 +16,10 @@
   "dependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "@tauri-apps/api": "2.12.4",
-    "@tauri-apps/plugin-process": "2.3.1",
+    "@tauri-apps/plugin-process": "2.4.0",
     "@tauri-apps/plugin-updater": "2.14.1",
     "qrcode": "^1.5.4",
-    "svelte": "^5.57.0",
+    "svelte": "^5.57.3",
     "vite": "^8.3.5"
   },
   "devDependencies": {
