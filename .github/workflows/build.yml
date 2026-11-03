@@ -36,8 +36,11 @@ jobs:
       - name: Install Node Dependencies
         run: npm install
 
+      # CI has no TAURI_SIGNING_PRIVATE_KEY, and createUpdaterArtifacts: true
+      # makes the bundler sign updater artifacts (signing fails without a key).
+      # The overlay disables just that for this unsigned installer build.
       - name: Build Tauri App
-        run: npm run tauri build
+        run: npm run tauri build -- --config src-tauri/tauri.ci.conf.json --bundles nsis
 
       - name: Upload Finished EXE
         uses: actions/upload-artifact@v4
